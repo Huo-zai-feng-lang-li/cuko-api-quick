@@ -15,3 +15,6 @@ Thumbs.db
 .DS_Store
 # 测试运行产物
 test/last-run.txt
+# Chrome/CDP 在 Windows 上可能生成的伪目录（环境变量未展开）
+%SystemDrive%/
+undefined/
