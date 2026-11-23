@@ -13,7 +13,7 @@ import {
   encodeUplinkFrame, extractInnerEvents, QuickTurnExtractor,
 } from '../bridge/quick-protocol.js';
 import { parseQuickUrl, buildConversationUrl, isOnConversation, extractThreadIdFromUrl, buildChatUrl } from '../bridge/page.js';
-import { DEFAULT_PROFILE_VALUES } from '../bridge/default-config.js';
+import { DEFAULT_PROFILE_VALUES, validateProfile } from '../bridge/default-config.js';
 import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD, safeFileName, cleanupAttachments } from '../bridge/attachments.js';
 
 const test = (name, fn) => globalThis.__test(name, fn);
@@ -242,4 +242,31 @@ test('只用 file 项、text 项不受影响', () => {
   const r = materializeFileItems([{ kind: 'text', text: 'hi' }, { kind: 'file', filename: 'z.txt', data: b64 }]);
   assert.equal(r.files.length, 1);
   cleanupAttachments(r.files);
+});
+
+// ============ 心跳 / 超时配置 ============
+test('配置里有 keepAliveSec 与 idleTimeoutSec', () => {
+  assert.equal(DEFAULT_PROFILE_VALUES.keepAliveSec, 20);
+  assert.equal(DEFAULT_PROFILE_VALUES.idleTimeoutSec, 180);
+});
+
+test('空闲超时默认比旧硬编码 120s 更宽松', () => {
+  assert.ok(DEFAULT_PROFILE_VALUES.idleTimeoutSec >= 180,
+    '默认空闲超时应该 >= 180s，实际 ' + DEFAULT_PROFILE_VALUES.idleTimeoutSec);
+});
+
+test('requestTimeoutSec 仍是总兜底，且大于 idleTimeoutSec', () => {
+  assert.ok(DEFAULT_PROFILE_VALUES.requestTimeoutSec > DEFAULT_PROFILE_VALUES.idleTimeoutSec);
+});
+
+test('新字段能被校验并接受合法值', () => {
+  const v = validateProfile({ keepAliveSec: 10, idleTimeoutSec: 300 });
+  assert.equal(v.keepAliveSec, 10);
+  assert.equal(v.idleTimeoutSec, 300);
+});
+
+test('新字段拒绝负数', () => {
+  let threw = false;
+  try { validateProfile({ idleTimeoutSec: -1 }); } catch { threw = true; }
+  assert.ok(threw, '负数应该被拒绝');
 });

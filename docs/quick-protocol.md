@@ -196,7 +196,7 @@ Cuko 客户端 --HTTP/SSE--> bridge/index.js --CDP--> 独立 Chrome --user-data-
 
 ---
 
-## 八、文件附件（实测）
+## 七、文件附件（实测）
 
 页面里有一个**隐藏的** `input[type=file]`（`accept=*`、`multiple=true`）。
 用 CDP 的 `DOM.setFileInputFiles` 把本地绝对路径写进去，页面会自动走完整上传：
@@ -217,7 +217,16 @@ POST /sn/account/<id>/qbsproxy/quicksight/accounts/<id>/invocations/files/upload
 - 上传是异步的，要等 `files/upload` 返回或附件卡片出现，再点发送
 - 纯附件消息的 textarea 本来就是空的，不能因为「输入框为空」判定发送失败
 
-## 七、已知限制
+## 八、心跳与长静默
+
+Quick 的下行帧里有 `keepalive` 事件（`{"type":"keepalive","ts":...}`），
+但**不能依赖它判断任务是否还活着**：实测长任务中间可能出现
+**连续 39 秒没有任何帧**（思考阶段），而页面其实在正常生成。
+
+因此本项目的超时判定不只看「有没有帧」，还会在超时到点时
+探测页面上的**停止生成按钮**：按钮还在 = 仍在生成 = 继续等。
+
+## 九、已知限制
 
 - **单账号单并发**：同一账号同时只允许一轮对话（页面上只有一份输入区）。
 - **无文件/图片输入**：当前版本只做文本；Quick 的附件走独立的 `upload-attachment` + `files/upload` 流程，未实现。

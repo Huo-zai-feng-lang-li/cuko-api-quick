@@ -16,7 +16,6 @@ import { sendUserMessage, waitForComposer, startNewChat, gotoConversation, attac
 import { cleanupAttachments } from './attachments.js';
 import { extractThreadIdFromUrl, parseQuickUrl } from './page.js';
 
-const IDLE_TIMEOUT_MS = 120000;   // 连续 120s 无任何聊天事件 → 判定卡死
 const KEEPALIVE_MS = 20000;
 
 /**
@@ -92,13 +91,58 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
     res.write('data: ' + JSON.stringify({ output: [], providerSessionId: realSessionId }) + '\n\n');
   };
 
+  // [261123-idle-fix] 空闲超时改为可配置（默认 180s）。
+  // 语义是「连续这么久没有任何聊天事件」——每个事件都会重置它，
+  // 所以只要页面还在输出，这条超时永远不会触发。
+  const idleTimeoutMs = Math.max(30000, Math.round(((cfg && cfg.idleTimeoutSec) || 180) * 1000));
+  // [261123-idle-fix] 空闲超时不再一刀切：
+  // 到点后先问一次页面「还在生成吗」，仍在生成就再给一轮时间。
+  // 原因：Quick 思考阶段可能长时间不下发任何事件（实测有超过 2 分钟的静默），
+  // 单靠「无事件」判定会误杀正在正常工作的任务。
+  let idleStrikes = 0;
+
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      log('空闲超时（' + Math.round(IDLE_TIMEOUT_MS / 1000) + 's 无事件），强制结束');
+    idleStrikes = 0;   // 收到新事件就把确认计数清零
+    idleTimer = setTimeout(async () => {
+      if (dispatched || aborted) return;
+      const elapsed = Math.round(idleTimeoutMs / 1000);
+      const generating = await isGenerating(conn).catch(() => false);
+      idleStrikes++;
+      // [261123-idle-fix] 只要页面还在生成就不判超时（不设次数上限）。
+      // 原因：Quick 的思考阶段可能长时间不下发事件，实测有超过 2 分钟的静默；
+      // 用固定次数上限会在「事件稀疏但任务正常」时误杀。
+      // 真正的兜底交给「请求总超时」（requestTimeoutSec，默认 900s），
+      // 以及页面停止生成后这一轮立刻判超时。
+      if (generating) {
+        log('已 ' + elapsed + 's 无事件，但页面仍在生成中（第 ' + idleStrikes + ' 次确认），继续等待…');
+        resetIdleKeepStrikes();
+        return;
+      }
+      log('空闲超时（' + elapsed + 's 无事件，页面已不在生成），强制结束');
       timedOut = true;
       finish().catch(e => console.warn('[Chat] finish 异常:', e.message));
-    }, IDLE_TIMEOUT_MS);
+    }, idleTimeoutMs);
+  };
+
+  /** 二次确认时不把 idleStrikes 清零，便于日志统计确认了几次 */
+  const resetIdleKeepStrikes = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    const keep = idleStrikes;
+    idleTimer = setTimeout(async () => {
+      if (dispatched || aborted) return;
+      const elapsed = Math.round(idleTimeoutMs / 1000);
+      const generating = await isGenerating(conn).catch(() => false);
+      idleStrikes = keep + 1;
+      if (generating) {
+        log('已 ' + elapsed + 's 无事件，但页面仍在生成中（第 ' + idleStrikes + ' 次确认），继续等待…');
+        resetIdleKeepStrikes();
+        return;
+      }
+      log('空闲超时（' + elapsed + 's 无事件，页面已不在生成），强制结束');
+      timedOut = true;
+      finish().catch(e => console.warn('[Chat] finish 异常:', e.message));
+    }, idleTimeoutMs);
   };
 
   /** 收尾：推 done 并释放资源 */
@@ -214,10 +258,12 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
       log,
       onEvent: (evt) => {
         if (aborted || dispatched) return;
-        if (!firstEventSeen) {
-          firstEventSeen = true;
-          resetIdle();
-        }
+        // [261123-idle-fix] 关键修复：每收到一个事件就重置空闲计时器。
+        // 旧实现只在「首次收到事件」时 reset 一次，之后再不重置，
+        // 结果从首帧算起 120s 一到就无条件判超时 —— 哪怕页面一直在正常输出。
+        // 长思考、长回复、agent 多步任务、附件解析慢，全都会撞上这个误报。
+        firstEventSeen = true;
+        resetIdle();
         // [261123-continue-fix] 续接时如果收到的帧属于别的会话，说明页面根本没切过去。
         // 旧实现静默 return，结果所有事件被丢弃 → 客户端表现成「超时且无输出」，很难排查。
         // 现在直接判失败并说明原因。
@@ -258,9 +304,18 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
       timedOut = true;
       finish().catch(e => console.warn('[Chat] finish 异常:', e.message));
     }, Math.round((cfg.requestTimeoutSec || 900) * 1000));
+    // [261123-idle-fix] 心跳加厚：SSE 注释帧保持连接不被中间层掐断，
+    // 同时把已用时长写进注释，方便排查「到底卡了多久」。
+    const keepAliveMs = Math.max(5000, Math.round((cfg.keepAliveSec || 20) * 1000));
+    const startedAt = Date.now();
     keepAliveTimer = setInterval(() => {
-      try { if (!res.writableEnded) res.write(': keepalive\n\n'); } catch (_) {}
-    }, KEEPALIVE_MS);
+      try {
+        if (!res.writableEnded) {
+          const el = Math.round((Date.now() - startedAt) / 1000);
+          res.write(': keepalive ' + el + 's\n\n');
+        }
+      } catch (_) {}
+    }, keepAliveMs);
 
     // ---------- 3. 发送 ----------
     // 客户端断开后不要再往页面里打字，避免污染会话

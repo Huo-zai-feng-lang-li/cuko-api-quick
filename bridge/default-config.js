@@ -33,6 +33,20 @@ export const DEFAULT_PROFILE_VALUES = Object.freeze({
    * 真正的卡死判定由 index.js 的空闲超时负责，这里只兜「永不结束」。
    */
   requestTimeoutSec: 900,
+  /**
+   * SSE 心跳间隔（秒）。
+   * 长任务期间每隔这么久发一个 SSE 注释帧保活，
+   * 避免客户端或中间代理因「长时间无数据」掐断连接。
+   */
+  keepAliveSec: 20,
+  /**
+   * 空闲超时（秒）：连续这么久「没有收到任何聊天事件」才判定卡死。
+   *
+   * [261123-idle-fix] 注意是「没有任何事件」——只要页面还在输出
+   * （思考 / 正文 / 工具进度 / keepalive），计时器就会被重置，不会误判。
+   * 旧实现只在首帧重置一次，导致 120s 后无条件超时，长回复必定撞上。
+   */
+  idleTimeoutSec: 180,
   /** 连接聊天 WebSocket 的最长等待秒数 */
   wsConnectTimeoutSec: 30,
   /** WebSocket 握手后等待 session_established/connected 的最长秒数 */
@@ -58,7 +72,9 @@ export const FIELD_LABELS = Object.freeze({
   targetUrl: '启动页面 URL（/sn/start 会自动跳到聊天页）',
   connectPollMaxSec: 'CDP 端口就绪超时（秒）',
   pageReadyPollMaxSec: '页面就绪超时（秒）',
-  requestTimeoutSec: '请求超时（秒）',
+  keepAliveSec: 'SSE 心跳间隔（秒）',
+  idleTimeoutSec: '空闲超时（秒，无任何事件才算卡死）',
+  requestTimeoutSec: '请求总超时（秒）',
   wsConnectTimeoutSec: 'WebSocket 连接超时（秒）',
   wsAckTimeoutSec: '会话握手超时（秒）',
   textPasteWaitMinSec: '文本粘贴等待下限（秒）',
@@ -72,6 +88,7 @@ export const FIELD_LABELS = Object.freeze({
 /** 数值型字段列表（校验用） */
 const NUMBER_FIELDS = [
   'connectPollMaxSec', 'pageReadyPollMaxSec', 'requestTimeoutSec',
+  'keepAliveSec', 'idleTimeoutSec',
   'wsConnectTimeoutSec', 'wsAckTimeoutSec',
   'textPasteWaitMinSec', 'textPasteWaitMaxSec',
   'preEnterWaitMinSec', 'preEnterWaitMaxSec',
