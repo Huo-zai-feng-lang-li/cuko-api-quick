@@ -127,3 +127,45 @@ export async function ensureChrome(account, cfg, targetUrl) {
   if (!ok) console.error('[Chrome] 账号 ' + account.modelId + ' 启动超时');
   return ok;
 }
+
+/**
+ * 确保账号的 CDP 连接可用，必要时自动启动 Chrome。
+ *
+ * [261123-autolaunch] 为什么需要它：
+ * 请求路径原先直接 getConnection()，端口不通就抛 ECONNREFUSED 给客户端，
+ * 表现成「Provider 内部错误」。但 Chrome 完全可能被用户关掉（重启电脑、
+ * 手滑关窗），这时应该自动拉起来，而不是让客户端一直报错。
+ *
+ * 流程：
+ *   1. 端口活着 → 直接取连接（最常见，零开销）
+ *   2. 端口不通 → 启动 Chrome → 等端口就绪 → 取连接
+ *   3. 还失败 → 抛出带操作提示的错误
+ *
+ * @param {object} account 账号（modelId / debugPort）
+ * @param {object} cfg 生效配置方案 values
+ * @param {(account:object, match:string)=>Promise<object>} getConnectionFn getConnection 实现
+ * @param {string} [targetMatch] 目标页面 URL 片段
+ * @returns {Promise<object>} CDP 连接
+ */
+export async function ensureConnection(account, cfg, getConnectionFn, targetMatch = 'quick.aws.com') {
+  // 1) 端口活着就直接连
+  if (await probePort(account.debugPort)) {
+    return await getConnectionFn(account, targetMatch);
+  }
+
+  // 2) 端口不通 → 启动 Chrome 再连
+  console.log('[Chrome] 账号 ' + account.modelId + ' 调试端口 ' + account.debugPort + ' 不通，自动启动 Chrome…');
+  const ok = await ensureChrome(account, cfg);
+  if (!ok) {
+    throw new Error([
+      '无法启动 Chrome（端口 ' + account.debugPort + '）。请检查：',
+      '  1) 本机是否安装了 Chrome（或在配置方案里指定 chromePath）',
+      '  2) 该账号的 Chrome 是否被其它进程占用',
+      '  3) 首次使用需要在弹出的窗口里登录 quick.aws.com',
+    ].join('\\n'));
+  }
+  console.log('[Chrome] 账号 ' + account.modelId + ' 已启动，端口就绪');
+
+  // 3) 连上它
+  return await getConnectionFn(account, targetMatch);
+}

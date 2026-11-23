@@ -126,6 +126,32 @@ Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件
 **验收**：单测覆盖 `buildChatUrl` 三种入参 + 默认值 + 路由后解析，共 20 项全过；
 已确认代码中不再有裸 `/sn` 字面量。
 
+### 261123-autolaunch：Chrome 被关掉后不会自动拉起
+
+**现象**：关闭 Chrome 后再发对话，客户端报
+「Provider 内部错误，请稍后重试。（connect ECONNREFUSED 127.0.0.1:9222）」。
+
+**根因**：`/v1/responses` 直接调用 `getConnection()`，它只连「已经存在的」
+调试端口，连不上就抛错。`ensureChrome()` 早就有（健康检查在用），
+但请求路径从来没调过它。
+
+**修法**：
+- `chrome.js` 新增 `ensureConnection()`：端口活着直接连；不通则
+  `ensureChrome()` 拉起 → 等端口就绪 → 再连。失败时抛出可操作的错误
+  （列出没装 Chrome / 端口被占 / 需要登录三种排查方向），而不是原始 ECONNREFUSED。
+- `index.js` 的请求路径改用 `ensureConnection`。
+- `chat.js` 在「输入区未就绪」时不再直接失败，先自动导航一次到聊天页再等，
+  覆盖「Chrome 刚拉起、页面还停在入口」的情况。
+
+**验收**（真机，Chrome 完全关闭状态发请求）：
+```
+[Chrome] 账号 quick-main 调试端口 9222 不通，自动启动 Chrome…
+[Chrome] 账号 quick-main 已启动，端口就绪
+[CDP-conn] connected: quick-main port 9222
+[Chat] 页面就绪 … 本轮结束：正文 2 字
+```
+全程 17.5s，客户端无报错。
+
 ## 遗留
 
 - **文件/图片输入**：Quick 的附件走独立的 `upload-attachment` → DLP 扫描 → `files/upload` 流程，

@@ -701,6 +701,29 @@ npm test
 
 ## 常见问题
 
+**Q：Chrome 被关掉了，Cuko 客户端报「Provider 内部错误（ECONNREFUSED）」？**
+
+不用管，**服务会自动把 Chrome 拉起来**。
+
+实测：Chrome 完全关闭状态下发请求，服务检测到调试端口不通 →
+自动启动 Chrome → 等端口就绪 → 等页面加载 → 发送消息 → 返回结果，
+全程约 17 秒，客户端只会感觉「这条回复慢了点」，不会报错。
+
+启动过程的日志：
+
+```
+[Chrome] 账号 quick-main 调试端口 9222 不通，自动启动 Chrome…
+[Chrome] 账号 quick-main 已启动，端口就绪
+[CDP-conn] connected: quick-main port 9222
+[Chat] 页面就绪，输入区选择器=textarea…
+```
+
+只有在**真的启动不了**时才会报错（比如没装 Chrome、端口被别的程序占用），
+错误信息里会写明具体原因和排查步骤。
+
+> 前提是那个 Chrome profile 里之前登录过 Quick。如果从未登录，
+> 自动拉起的窗口会停在登录页，需要你手动登录一次。
+
 **Q：管理台的「健康」显示 `login_required`**
 
 弹出的那个 Chrome 窗口还没登录。点账号行的「打开」，在弹出的窗口里登录 quick.aws.com。

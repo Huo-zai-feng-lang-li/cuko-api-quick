@@ -167,9 +167,22 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
     // ---------- 1. 页面就绪 ----------
     let st = await waitForComposer(conn, cfg.pageReadyPollMaxSec);
     if (!st) {
-      // 可能停在登录页或非聊天页，给出明确提示
+      // [261123-autolaunch] Chrome 刚被自动拉起时，页面可能还停在落地页/登录页，
+      // 或者根本没加载完。这里自动导航一次到聊天页再等，而不是直接失败。
       const url = await currentUrl(conn);
-      throw new Error('页面输入区未就绪（当前 URL: ' + url + '），请确认已登录 quick.aws.com');
+      log('输入区未就绪（当前 URL=' + url + '），尝试自动导航到聊天页…');
+      const navOk = await startNewChat(conn, cfg).catch(() => false);
+      if (navOk) {
+        st = await waitForComposer(conn, cfg.pageReadyPollMaxSec);
+      }
+      if (!st) {
+        const url2 = await currentUrl(conn);
+        throw new Error(
+          '页面输入区未就绪（当前 URL: ' + url2 + '）。' +
+          '请确认那个 Chrome 窗口里已经登录 quick.aws.com，' +
+          '并且能看到聊天输入框。',
+        );
+      }
     }
     log('页面就绪，输入区选择器=' + st.sel + '，当前 URL=' + (await currentUrl(conn)));
 

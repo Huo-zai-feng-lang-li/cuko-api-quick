@@ -27,7 +27,7 @@ import { getAccounts, saveAccounts, getProfiles, saveProfiles, resolveProfile,
   ensureDataDirs, initLogFile, teeConsoleToFile, PROFILES_DIR, getAccountHealth, saveAccountHealth } from './store.js';
 import { DEFAULT_PROFILE_VALUES, FIELD_LABELS, validateProfile } from './default-config.js';
 import { readUiIndexHtml } from './app-paths.js';
-import { launchChrome, probePort, resolveChromePath } from './chrome.js';
+import { launchChrome, probePort, resolveChromePath, ensureConnection } from './chrome.js';
 import { getConnection, closeConnection, closeAllConnections } from './cdp-connection.js';
 import { handleChat } from './chat.js';
 import { handleCompress } from './compress.js';
@@ -169,7 +169,8 @@ const server = http.createServer(async (req, res) => {
 
     const profile = resolveProfile(account);
     try {
-      const conn = await getConnection(account, 'quick.aws.com');
+      // [261123-autolaunch] Chrome 被关掉时自动拉起，而不是把 ECONNREFUSED 甩给客户端。
+      const conn = await ensureConnection(account, profile.values, getConnection, 'quick.aws.com');
       if (payload.type === 'compress') {
         await handleCompress({ res, payload, account, conn, cfg: profile.values, profile, release });
       } else {
