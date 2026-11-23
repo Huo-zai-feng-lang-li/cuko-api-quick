@@ -599,6 +599,36 @@ dist/
 > 不支持该参数的版本，会去 PATH / Program Files 里找）。也可用环境变量
 > `NODE_SEA_BIN` 显式指定。
 
+### 自动发布（GitHub Actions）
+
+仓库带了一个 workflow：`.github/workflows/release-exe.yml`。
+
+**打 tag 就会自动构建并发布 exe**：
+
+```bash
+git tag v0.0.2
+git push origin v0.0.2
+```
+
+也可以在 GitHub 网页上：
+
+- **Actions → Release EXE → Run workflow**，填 tag 名手动触发
+- 或直接**创建 Release**（Publish 时触发）
+
+workflow 做的事：
+
+| 步骤 | 内容 |
+|---|---|
+| 环境 | `windows-latest` + Node 26（`--build-sea` 需要 >= 25.5） |
+| 依赖 | `npm ci` |
+| 测试 | `npm test`（协议层 9 项回归） |
+| 构建 | `npm run build:exe` |
+| 校验 | 检查 exe 存在且体积 > 50 MB（防止构建静默失败） |
+| 冒烟 | 真的启动 exe，请求 `/v1/models`、`/`、`/api/info` 确认可用 |
+| 发布 | 上传 `cuko-api-quick-<tag>.exe` + `使用说明-<tag>.txt` 到 Release，自动生成 release notes |
+
+产物同时作为 workflow artifact 保留 30 天。
+
 
 ## 验证
 
