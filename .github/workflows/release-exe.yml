@@ -157,7 +157,7 @@ jobs:
             | 文件 | 说明 |
             |---|---|
             | `cuko-api-quick-${{ steps.meta.outputs.tag }}.exe` | 单文件版，**自带 Node 运行时，目标机不用装 Node**（约 100 MB） |
-            | `使用说明-${{ steps.meta.outputs.tag }}.txt` | 快速上手说明 |
+            | `README-${{ steps.meta.outputs.tag }}.txt` | 快速上手说明 |
 
             ### 快速开始
 
