@@ -247,7 +247,7 @@ function renderProfiles() {
       + (p.isDefault ? '' : '<button class="small" onclick="saveProfile(\'' + esc(p.id) + '\')">保存</button>'
         + '<button class="small danger" onclick="delProfile(\'' + esc(p.id) + '\')">删除</button>')
       + '</div>'
-      + '<details' + (p.isDefault ? '' : '') + '><summary>展开参数（' + Object.keys(p.values || {}).length + ' 项）</summary>'
+      + '<details' + (p.isDefault ? '' : '') + '><summary>展开参数（' + Object.keys(p.values || {}).length + ' 个参数）</summary>'
       + '<div class="fields">' + fields + '</div></details>'
       + '</div>';
   }).join('');
