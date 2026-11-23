@@ -57,7 +57,9 @@ export function launchChrome(account, cfg, targetUrl) {
   const userDataDir = path.join(PROFILES_DIR, account.modelId);
   if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
-  const url = targetUrl || (cfg && cfg.targetUrl) || 'https://quick.aws.com/sn';
+  // [261123-entry-fix] 兜底用 /sn/start：它会自动路由到带账号 ID 的聊天页；
+  // 旧的 /sn 是产品落地页，没有输入框。
+  const url = targetUrl || (cfg && cfg.targetUrl) || 'https://quick.aws.com/sn/start';
   const extraArgs = String((cfg && cfg.extraArgs) || '').trim();
   const antiThrottle = !!(cfg && cfg.disableBackgroundThrottling);
 

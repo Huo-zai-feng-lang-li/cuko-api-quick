@@ -12,7 +12,8 @@ import {
   esDrain, decodeOuterPayload, decodeEventStreamMessage, decodeUplinkFrame,
   encodeUplinkFrame, extractInnerEvents, QuickTurnExtractor,
 } from '../bridge/quick-protocol.js';
-import { parseQuickUrl, buildConversationUrl, isOnConversation, extractThreadIdFromUrl } from '../bridge/page.js';
+import { parseQuickUrl, buildConversationUrl, isOnConversation, extractThreadIdFromUrl, buildChatUrl } from '../bridge/page.js';
+import { DEFAULT_PROFILE_VALUES } from '../bridge/default-config.js';
 
 const test = (name, fn) => globalThis.__test(name, fn);
 const assert = globalThis.__assert;
@@ -157,4 +158,24 @@ test('会话判定：只有 id 完全相同才算在同一会话', () => {
 test('extractThreadIdFromUrl 与 parseQuickUrl 一致', () => {
   assert.equal(extractThreadIdFromUrl(chatUrl(CA)), CA);
   assert.equal(extractThreadIdFromUrl(chatUrl()), null);
+});
+
+// ============ 入口页（/sn vs /sn/start）============
+test('默认 targetUrl 用 /sn/start，不是落地页 /sn', () => {
+  assert.equal(DEFAULT_PROFILE_VALUES.targetUrl, 'https://quick.aws.com/sn/start');
+});
+
+test('buildChatUrl：有账号 ID 时直达聊天页', () => {
+  assert.equal(buildChatUrl('261414899405'), 'https://quick.aws.com/sn/account/261414899405/start/chat');
+});
+
+test('buildChatUrl：没有账号 ID 时兜底到 /sn/start（绝不能是 /sn）', () => {
+  assert.equal(buildChatUrl(null), 'https://quick.aws.com/sn/start');
+  assert.equal(buildChatUrl(''), 'https://quick.aws.com/sn/start');
+  assert.equal(buildChatUrl(undefined), 'https://quick.aws.com/sn/start');
+});
+
+test('/sn/start 本身解析不出账号，跳转后才有', () => {
+  assert.equal(parseQuickUrl('https://quick.aws.com/sn/start').accountId, null);
+  assert.equal(parseQuickUrl('https://quick.aws.com/sn/account/261414899405/start/chat').accountId, '261414899405');
 });

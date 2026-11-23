@@ -12,8 +12,15 @@ export const DEFAULT_PROFILE_VALUES = Object.freeze({
   chromePath: '',
   /** 追加的 Chrome 启动参数，如 --proxy-server=http://127.0.0.1:8080 */
   extraArgs: '',
-  /** 目标页面 URL（Amazon Quick 网页版） */
-  targetUrl: 'https://quick.aws.com/sn',
+  /**
+   * 首次启动 Chrome 时打开的页面。
+   *
+   * [261123-entry-fix] 用 /sn/start 而不是 /sn：
+   *   /sn       → 产品落地页（Features / Pricing / Sign in），永远没有输入框
+   *   /sn/start → 会自动路由到 /sn/account/<账号ID>/start/chat（实测约 10s）
+   * 这样不需要知道用户的账号 ID，也能进到真正的聊天页。
+   */
+  targetUrl: 'https://quick.aws.com/sn/start',
 
   // ===== 时序组（秒，支持小数） =====
   /** 等待 CDP 调试端口就绪的最长秒数 */
@@ -48,7 +55,7 @@ export const DEFAULT_PROFILE_VALUES = Object.freeze({
 export const FIELD_LABELS = Object.freeze({
   chromePath: 'Chrome 路径（留空自动探测）',
   extraArgs: '额外启动参数',
-  targetUrl: '目标页面 URL',
+  targetUrl: '启动页面 URL（/sn/start 会自动跳到聊天页）',
   connectPollMaxSec: 'CDP 端口就绪超时（秒）',
   pageReadyPollMaxSec: '页面就绪超时（秒）',
   requestTimeoutSec: '请求超时（秒）',

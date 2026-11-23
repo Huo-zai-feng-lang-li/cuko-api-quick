@@ -207,3 +207,104 @@ export function isOnConversation(currentUrl, wantConversationId) {
   if (!wantConversationId) return false;
   return parseQuickUrl(currentUrl).conversationId === String(wantConversationId);
 }
+
+/**
+ * 从页面读出 AWS 账号 ID（用于拼聊天页 URL）。
+ *
+ * 实测（2026-11-23）有三条可靠来源，按优先级取：
+ *   1. cookie `qs-directory-alias`       —— 最直接，形如 "261414899405"
+ *   2. cookie `aws-directoryUserInfo`    —— JSON，里面有 alias 字段
+ *   3. localStorage `quickwork-web-last-user` —— ARN，形如
+ *      arn:aws:quicksight::<accountId>:user-internal/...
+ *
+ * 注意：document.cookie 读不到 httpOnly 的，所以 cookie 走 CDP 的
+ * Network.getAllCookies；页面内的 localStorage 用 Runtime.evaluate 读。
+ */
+export const READ_ACCOUNT_FROM_STORAGE_EXPR = `(() => {
+  const out = { alias: null, fromArn: null };
+  try {
+    const raw = localStorage.getItem('quickwork-web-last-user') || '';
+    const m = raw.match(/arn:aws:[a-z]+::(\d{8,}):/i);
+    if (m) out.fromArn = m[1];
+  } catch (e) {}
+  try {
+    const saved = localStorage.getItem('qs-saved-accounts');
+    // qs-saved-accounts 有时在 cookie 里，有时在 localStorage，格式 {"a":[{"id":"..."}]}
+    if (saved) {
+      const j = JSON.parse(saved);
+      const first = j && Array.isArray(j.a) ? j.a[0] : null;
+      if (first) out.alias = String(first.id || first.an || '') || null;
+    }
+  } catch (e) {}
+  return out;
+})()`;
+
+/**
+ * 探测当前登录账号的 AWS 账号 ID。
+ * @param {object} conn CDP 常驻连接
+ * @returns {Promise<string|null>}
+ */
+export async function detectAccountId(conn) {
+  // 1) 当前 URL 里已经有就直接用（最快最准）
+  const urlNow = await conn.Runtime
+    .evaluate({ expression: 'location.href', returnByValue: true })
+    .then((r) => (r && r.result && r.result.value) || '')
+    .catch(() => '');
+  const fromUrl = parseQuickUrl(urlNow).accountId;
+  if (fromUrl) return fromUrl;
+
+  // 2) cookie（需要 CDP Network 域，httpOnly 也能读）
+  try {
+    const res = await conn.Network.getAllCookies();
+    const cookies = (res && res.cookies) || [];
+    const pick = (name) => {
+      const c = cookies.find((k) => k.name === name && String(k.domain || '').includes('quick.aws.com'));
+      return c ? String(c.value || '') : '';
+    };
+    const alias = pick('qs-directory-alias');
+    if (/^\d{8,}$/.test(alias)) return alias;
+
+    const dirInfo = pick('aws-directoryUserInfo');
+    if (dirInfo) {
+      try {
+        const j = JSON.parse(decodeURIComponent(dirInfo));
+        if (j && j.alias && /^\d{8,}$/.test(String(j.alias))) return String(j.alias);
+      } catch (_) {}
+    }
+    const saved = pick('qs-saved-accounts');
+    if (saved) {
+      try {
+        const j = JSON.parse(decodeURIComponent(saved));
+        const first = j && Array.isArray(j.a) ? j.a[0] : null;
+        const id = first && (first.id || first.an);
+        if (id && /^\d{8,}$/.test(String(id))) return String(id);
+      } catch (_) {}
+    }
+  } catch (e) {
+    console.warn('[Page] 读取 cookie 失败:', e.message);
+  }
+
+  // 3) localStorage（ARN 兜底）
+  try {
+    const r = await conn.Runtime.evaluate({ expression: READ_ACCOUNT_FROM_STORAGE_EXPR, returnByValue: true });
+    const v = (r && r.result && r.result.value) || {};
+    if (v.alias && /^\d{8,}$/.test(String(v.alias))) return String(v.alias);
+    if (v.fromArn && /^\d{8,}$/.test(String(v.fromArn))) return String(v.fromArn);
+  } catch (e) {
+    console.warn('[Page] 读取 localStorage 失败:', e.message);
+  }
+
+  return null;
+}
+
+/**
+ * 构造聊天页 URL（不带会话）。
+ * @param {string} accountId
+ */
+export function buildChatUrl(accountId) {
+  return accountId
+    ? 'https://quick.aws.com/sn/account/' + accountId + '/start/chat'
+    // [261123-entry-fix] 没有账号 ID 时用 /sn/start（会自动路由到聊天页），
+    // 不能用 /sn —— 那是落地页。
+    : 'https://quick.aws.com/sn/start';
+}

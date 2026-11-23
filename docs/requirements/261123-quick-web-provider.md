@@ -105,6 +105,27 @@ Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件
 
 **验收**：A→B→A 来回切换，分别答出 111 / 222 / 111；新增 7 项 URL 单测。
 
+### 261123-entry-fix：入口页用错，永远进不了聊天页
+
+**问题**：`targetUrl` 默认值 `https://quick.aws.com/sn` 是**产品落地页**
+（Features / Pricing / Sign in），实测等 18 秒也只有 7441 字符的介绍内容、
+`textarea` 恒为 0，服务必然报「输入区未就绪」。
+
+**根因**：真正的聊天页是 `/sn/account/<账号ID>/start/chat`，
+而账号 ID 我们并不知道，旧代码的兜底又直接导航到落地页。
+
+**修法**：
+- `targetUrl` 默认值改为 `https://quick.aws.com/sn/start` —— 实测会自动
+  路由到带账号 ID 的聊天页（约 10s 出输入框）
+- 新增 `detectAccountId()`：按「当前 URL → cookie `qs-directory-alias` →
+  cookie `aws-directoryUserInfo` → localStorage ARN」四级探测账号 ID
+- `startNewChat()` 改为三段式：点「新对话」按钮 → 有账号 ID 就直达聊天页
+  → 都没有则退回 `/sn/start`
+- `chrome.js` 与 `buildChatUrl()` 的兜底全部从 `/sn` 改成 `/sn/start`
+
+**验收**：单测覆盖 `buildChatUrl` 三种入参 + 默认值 + 路由后解析，共 20 项全过；
+已确认代码中不再有裸 `/sn` 字面量。
+
 ## 遗留
 
 - **文件/图片输入**：Quick 的附件走独立的 `upload-attachment` → DLP 扫描 → `files/upload` 流程，

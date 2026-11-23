@@ -14,6 +14,7 @@ import {
   READ_COMPOSER_EXPR, FOCUS_COMPOSER_EXPR, IS_GENERATING_EXPR,
   SEND_BUTTON_STATE_EXPR, DUMP_STATE_EXPR, NEW_CHAT_EXPR,
   parseQuickUrl, buildConversationUrl, isOnConversation,
+  detectAccountId, buildChatUrl,
 } from './page.js';
 
 /** 读输入区状态 */
@@ -260,19 +261,48 @@ export async function sendUserMessage(conn, text, cfg, opts = {}) {
 
 /** 回到「新对话」 */
 export async function startNewChat(conn, cfg) {
+  // 1) 首选：点页面自己的「新对话」按钮（最贴近真实用户操作）
   try {
     const r = await conn.Runtime.evaluate({ expression: NEW_CHAT_EXPR, returnByValue: true });
     const v = (r && r.result && r.result.value) || {};
     if (v.ok) {
       console.log('[Send] 已点击新对话按钮');
       await new Promise(res => setTimeout(res, 1200));
-      return true;
+      // 点完之后必须确认真的到了聊天页，否则继续走兜底
+      const st = await waitForComposer(conn, 10);
+      if (st) return true;
+      console.warn('[Send] 点了新对话但输入区没出来，改用 URL 兜底');
     }
   } catch (_) {}
+
+  // 2) 兜底：直接导航到「当前已登录账号」的聊天页。
+  // [261123-entry-fix] 旧实现导航到 "https://quick.aws.com/sn" 是错的：
+  // 那是产品落地页（Features/Pricing/Sign in），永远没有输入框。
+  // 正确入口是 /sn/account/<账号ID>/start/chat，账号 ID 从页面 cookie/localStorage 探测。
+  // 优先用探测到的账号 ID 直接拼聊天页（最快，少一次跳转）
   try {
-    await conn.Page.navigate({ url: 'https://quick.aws.com/sn' });
-    await new Promise(res => setTimeout(res, 2000));
-    return true;
+    const accountId = await detectAccountId(conn);
+    if (accountId) {
+      const url = buildChatUrl(accountId);
+      console.log('[Send] 导航到聊天页:', url);
+      await conn.Page.navigate({ url });
+      const st = await waitForComposer(conn, Math.max(15, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25)));
+      if (st) return true;
+      console.warn('[Send] 直达聊天页后输入区未就绪，改用 /sn/start 兜底');
+    }
+  } catch (e) {
+    console.warn('[Send] 直连聊天页失败:', e.message);
+  }
+
+  // 探测不到账号 ID 时，走 /sn/start —— 页面自己会路由到正确的聊天页
+  try {
+    const fallback = 'https://quick.aws.com/sn/start';
+    console.log('[Send] 导航到入口页:', fallback);
+    await conn.Page.navigate({ url: fallback });
+    const st = await waitForComposer(conn, Math.max(20, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25)));
+    if (st) return true;
+    console.warn('[Send] 入口页导航后输入区仍未就绪');
+    return false;
   } catch (e) {
     console.warn('[Send] 新建对话失败:', e.message);
     return false;
