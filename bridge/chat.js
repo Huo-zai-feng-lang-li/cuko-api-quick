@@ -12,8 +12,8 @@
  */
 import { QuickTurnExtractor } from './quick-protocol.js';
 import { QuickChannel } from './quick-transport.js';
-import { sendUserMessage, waitForComposer, startNewChat, isGenerating, currentUrl } from './quick-sender.js';
-import { extractThreadIdFromUrl } from './page.js';
+import { sendUserMessage, waitForComposer, startNewChat, gotoConversation, isGenerating, currentUrl } from './quick-sender.js';
+import { extractThreadIdFromUrl, parseQuickUrl } from './page.js';
 
 const IDLE_TIMEOUT_MS = 120000;   // 连续 120s 无任何聊天事件 → 判定卡死
 const KEEPALIVE_MS = 20000;
@@ -178,6 +178,16 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
       await startNewChat(conn, cfg);
       st = await waitForComposer(conn, cfg.pageReadyPollMaxSec);
       if (!st) throw new Error('新建对话后输入区未就绪');
+    } else {
+      // [261123-continue-fix] 续接必须真的切到目标会话。
+      // 旧实现只在「新建」时动页面，续接时直接用页面当前停留的会话发消息，
+      // 导致客户端传了 A 的 providerSessionId、消息却发进了 B，上下文串台。
+      const wantId = String(payload.providerSessionId);
+      const nav = await gotoConversation(conn, wantId, cfg);
+      if (!nav.ok) {
+        throw new Error('续接失败：' + nav.error + '。如果你切换过 Quick 账号或清空过登录态，请新建对话。');
+      }
+      if (nav.navigated) log('已切到目标会话:', wantId);
     }
 
     // ---------- 2. 挂下行帧监听 ----------
@@ -190,9 +200,17 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
           firstEventSeen = true;
           resetIdle();
         }
-        // 续接时事件里可能混入别的会话，按 thread 过滤（拿不到 thread 的事件也放行）
+        // [261123-continue-fix] 续接时如果收到的帧属于别的会话，说明页面根本没切过去。
+        // 旧实现静默 return，结果所有事件被丢弃 → 客户端表现成「超时且无输出」，很难排查。
+        // 现在直接判失败并说明原因。
         const evtThread = evt.thread_id || (evt.payload && evt.payload.thread_id) || '';
-        if (payload.providerSessionId && evtThread && evtThread !== payload.providerSessionId) {
+        if (payload.providerSessionId && evtThread && evtThread !== String(payload.providerSessionId)) {
+          log('收到其它会话的事件（期望 ' + payload.providerSessionId + '，实际 ' + evtThread + '），判定会话不一致');
+          extractor.consume({
+            type: 'error',
+            payload: { message: '会话不一致：页面在 ' + evtThread + '，期望 ' + payload.providerSessionId },
+          });
+          finish().catch(e => console.warn('[Chat] finish 异常:', e.message));
           return;
         }
         extractor.consume(evt);

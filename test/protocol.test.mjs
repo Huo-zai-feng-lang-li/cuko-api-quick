@@ -12,6 +12,7 @@ import {
   esDrain, decodeOuterPayload, decodeEventStreamMessage, decodeUplinkFrame,
   encodeUplinkFrame, extractInnerEvents, QuickTurnExtractor,
 } from '../bridge/quick-protocol.js';
+import { parseQuickUrl, buildConversationUrl, isOnConversation, extractThreadIdFromUrl } from '../bridge/page.js';
 
 const test = (name, fn) => globalThis.__test(name, fn);
 const assert = globalThis.__assert;
@@ -114,4 +115,46 @@ test('状态机：text_complete 全文兜底', () => {
   ex.consume({ type: 'message_start', payload: {} });
   ex.consume({ type: 'text_complete', payload: { text: '只有全文' } });
   assert.equal(ex.text, '只有全文');
+});
+
+// ============ 会话 URL 解析（续接依赖它，回归重点） ============
+const CA = '090212b4-1268-44cf-843e-2e7f6faa9857';
+const CB = '6484c36d-7e7c-431d-b410-57456fb59201';
+const ACCT = '261414899405';
+const chatUrl = (cid) => 'https://quick.aws.com/sn/account/' + ACCT + '/start/chat' + (cid ? '?conversationId=' + cid : '');
+
+test('URL 解析：带会话', () => {
+  assert.deepEqual(parseQuickUrl(chatUrl(CA)), { accountId: ACCT, conversationId: CA });
+});
+
+test('URL 解析：不带会话', () => {
+  assert.deepEqual(parseQuickUrl(chatUrl()), { accountId: ACCT, conversationId: null });
+});
+
+test('URL 解析：多查询参数', () => {
+  const u = 'https://quick.aws.com/sn/account/' + ACCT + '/start/chat?foo=1&conversationId=' + CA + '&bar=2';
+  assert.equal(parseQuickUrl(u).conversationId, CA);
+});
+
+test('URL 解析：非法输入不抛异常', () => {
+  assert.deepEqual(parseQuickUrl(''), { accountId: null, conversationId: null });
+  assert.deepEqual(parseQuickUrl('https://example.com/x'), { accountId: null, conversationId: null });
+});
+
+test('构造会话 URL 后能被解析回', () => {
+  const built = buildConversationUrl(ACCT, CB);
+  assert.equal(parseQuickUrl(built).conversationId, CB);
+  assert.equal(parseQuickUrl(built).accountId, ACCT);
+});
+
+test('会话判定：只有 id 完全相同才算在同一会话', () => {
+  assert.equal(isOnConversation(chatUrl(CA), CA), true);
+  assert.equal(isOnConversation(chatUrl(CB), CA), false);
+  assert.equal(isOnConversation(chatUrl(), CA), false);
+  assert.equal(isOnConversation(chatUrl(CA), ''), false);
+});
+
+test('extractThreadIdFromUrl 与 parseQuickUrl 一致', () => {
+  assert.equal(extractThreadIdFromUrl(chatUrl(CA)), CA);
+  assert.equal(extractThreadIdFromUrl(chatUrl()), null);
 });

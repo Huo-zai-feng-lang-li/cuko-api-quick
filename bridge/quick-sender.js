@@ -13,6 +13,7 @@ import { randomInRange } from './default-config.js';
 import {
   READ_COMPOSER_EXPR, FOCUS_COMPOSER_EXPR, IS_GENERATING_EXPR,
   SEND_BUTTON_STATE_EXPR, DUMP_STATE_EXPR, NEW_CHAT_EXPR,
+  parseQuickUrl, buildConversationUrl, isOnConversation,
 } from './page.js';
 
 /** 读输入区状态 */
@@ -71,12 +72,24 @@ export async function currentUrl(conn) {
 
 /** 轮询等待输入区出现 */
 export async function waitForComposer(conn, maxSec) {
-  const max = Math.max(1, Math.ceil(maxSec));
-  for (let i = 0; i < max; i++) {
-    const st = await readComposer(conn);
-    if (st.ok) return st;
-    await new Promise(r => setTimeout(r, 1000));
+  // [261123-continue-fix] 导航后前 1~2 秒，页面处于 loading 中间态：
+  // Runtime.evaluate 可能抛「Cannot find context」或返回空，
+  // 旧实现只按 1s 一次粗轮询，容易在过渡期耗掉预算后误判失败。
+  // 改为 250ms 细轮询，并对异常/空结果继续重试，而不是直接当作未就绪。
+  const deadline = Date.now() + Math.max(1, maxSec) * 1000;
+  let lastErr = null;
+  while (Date.now() < deadline) {
+    try {
+      const r = await conn.Runtime.evaluate({ expression: READ_COMPOSER_EXPR, returnByValue: true });
+      const v = r && r.result && r.result.value;
+      if (v && v.ok) return v;
+    } catch (e) {
+      // 导航过渡期上下文重建，属预期，继续等
+      lastErr = e.message;
+    }
+    await new Promise(r => setTimeout(r, 250));
   }
+  if (lastErr) console.warn('[Send] waitForComposer 超时，最后一次错误:', lastErr);
   return null;
 }
 
@@ -264,4 +277,56 @@ export async function startNewChat(conn, cfg) {
     console.warn('[Send] 新建对话失败:', e.message);
     return false;
   }
+}
+
+/**
+ * 导航到指定会话并等它真的就位。
+ *
+ * 为什么不能只看「输入框出现了」：Quick 是 SPA，导航是异步的，
+ * textarea 在切会话过程中一直存在。必须等 URL 里的 conversationId 变成目标值，
+ * 再等输入区可用，才能保证消息发到正确的会话里。
+ *
+ * @param {object} conn CDP 常驻连接
+ * @param {string} conversationId 目标会话 ID
+ * @param {object} cfg 配置方案 values
+ * @returns {Promise<{ok:boolean, error?:string, url?:string}>}
+ */
+export async function gotoConversation(conn, conversationId, cfg) {
+  const before = await currentUrl(conn);
+  const { accountId } = parseQuickUrl(before);
+  if (!accountId) {
+    return { ok: false, error: '无法从当前 URL 解析账号 ID（当前: ' + before + '）' };
+  }
+  if (isOnConversation(before, conversationId)) {
+    console.log('[Send] 已经在目标会话里，无需导航');
+    return { ok: true, url: before, navigated: false };
+  }
+
+  const target = buildConversationUrl(accountId, conversationId);
+  console.log('[Send] 导航到会话:', target);
+  try {
+    await conn.Page.navigate({ url: target });
+  } catch (e) {
+    return { ok: false, error: '导航失败: ' + e.message };
+  }
+
+  // 等 URL 里的 conversationId 变成目标值；最多等 pageReadyPollMaxSec 秒
+  const maxSec = Math.max(5, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25));
+  const deadline = Date.now() + maxSec * 1000;
+  let urlNow = '';
+  while (Date.now() < deadline) {
+    urlNow = await currentUrl(conn);
+    if (isOnConversation(urlNow, conversationId)) {
+      // URL 切对之后，页面还要重新渲染一次（实测约 2~4s），
+      // 这里单独给一段充裕的时间等输入区，而不是沿用上面循环的剩余时间。
+      const st = await waitForComposer(conn, Math.max(15, maxSec));
+      if (st) {
+        console.log('[Send] 已进入会话并就绪:', urlNow);
+        return { ok: true, url: urlNow, navigated: true };
+      }
+      return { ok: false, error: '会话 URL 已切换但输入区未就绪（已等待 ' + Math.max(15, maxSec) + 's）: ' + urlNow };
+    }
+    await new Promise(r => setTimeout(r, 400));
+  }
+  return { ok: false, error: '导航超时：' + maxSec + 's 内 URL 未切到目标会话（当前: ' + urlNow + '，目标: ' + conversationId + '）' };
 }

@@ -85,6 +85,26 @@ Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件
 - [ ] 文件/图片输入
 - [ ] 账号组转移对话
 
+## 修订记录
+
+### 261123-continue-fix：续接没有真正切换会话
+
+**问题**：客户端传了 `providerSessionId`，消息仍发到页面当前停留的会话里。
+实测「建 A（记 111）→ 建 B（记 222）→ 续接 A 问数字」，Quick 答 **222**。
+
+**根因**：`chat.js` 只在 `isNewChat` 时动页面，续接分支没有任何导航逻辑，
+全仓库搜不到 `conversationId` 的使用。
+
+**修法**：
+- `page.js` 新增 `parseQuickUrl` / `buildConversationUrl` / `isOnConversation`
+- `quick-sender.js` 新增 `gotoConversation`：解析账号 ID → 导航 → 等 URL 切换 → 等输入区
+- `waitForComposer` 改为 250ms 细轮询并容忍导航过渡期的 evaluate 异常
+  （导航后 1~2 秒内会给页面上下文重建，旧实现会在这段耗掉预算后误判失败）
+- 续接时若收到别的 thread 的事件，从「静默丢弃」改为「明确报错」，
+  避免表现成无输出的超时
+
+**验收**：A→B→A 来回切换，分别答出 111 / 222 / 111；新增 7 项 URL 单测。
+
 ## 遗留
 
 - **文件/图片输入**：Quick 的附件走独立的 `upload-attachment` → DLP 扫描 → `files/upload` 流程，

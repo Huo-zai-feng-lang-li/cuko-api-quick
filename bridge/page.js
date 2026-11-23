@@ -156,13 +156,54 @@ export const DUMP_STATE_EXPR = `(() => {
   };
 })()`;
 
-/**
- * 从页面 URL 提取会话 ID。
- * Quick 的对话 id 形如 3e079448-101e-4a95-a95b-a3a942443ba8，出现在路径或查询里。
- * @param {string} url
- * @returns {string|null}
+/** Quick 对话 URL 的固定形态（实测）：
+ *  https://quick.aws.com/sn/account/<awsAccountId>/start/chat?conversationId=<uuid>
  */
+const URL_RE = /^https:\/\/quick\.aws\.com\/sn\/account\/([^/?#]+)\/start\/chat/i;
+
+/**
+ * 从页面 URL 里解析出账号 ID 和会话 ID。
+ * @param {string} url
+ * @returns {{ accountId: string|null, conversationId: string|null }}
+ */
+export function parseQuickUrl(url) {
+  const u = String(url || '');
+  const m = u.match(URL_RE);
+  const accountId = m ? m[1] : null;
+  let conversationId = null;
+  try {
+    const q = u.indexOf('?');
+    if (q >= 0) conversationId = new URLSearchParams(u.slice(q + 1)).get('conversationId');
+  } catch (_) {}
+  // 兜底：查询参数没解析到就取最后一个 UUID 形态的片段（兼容多级路径）
+  if (!conversationId) {
+    const seg = u.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (seg) conversationId = seg[0];
+  }
+  return { accountId, conversationId };
+}
+
+/** 只要会话 ID（兼容旧调用点） */
 export function extractThreadIdFromUrl(url) {
-  const m = String(url || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-  return m ? m[0] : null;
+  return parseQuickUrl(url).conversationId;
+}
+
+/**
+ * 构造某个会话的 URL。
+ * @param {string} accountId AWS 账号 ID
+ * @param {string} conversationId 会话 ID
+ */
+export function buildConversationUrl(accountId, conversationId) {
+  return 'https://quick.aws.com/sn/account/' + accountId + '/start/chat?conversationId=' + encodeURIComponent(conversationId);
+}
+
+/**
+ * 判定「当前页面是否已经在目标会话里」。
+ * 都用 conversationId 精确比对，避免把「同账号的别的会话」误判成已就位。
+ * @param {string} currentUrl
+ * @param {string} wantConversationId
+ */
+export function isOnConversation(currentUrl, wantConversationId) {
+  if (!wantConversationId) return false;
+  return parseQuickUrl(currentUrl).conversationId === String(wantConversationId);
 }

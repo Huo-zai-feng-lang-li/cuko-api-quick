@@ -511,10 +511,22 @@ agentic 多步任务会连续发多轮 `message_start … message_complete`，�
 
 ### 会话续接
 
-Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件里拿到（`message_start.thread_id`
-或 `title_generated.payload.conversation_id`），作为 `providerSessionId` 回给客户端。
+Quick 的 `thread_id`（也就是 URL 里的 `conversationId`）就是会话句柄。
+第一轮从下行事件里拿到，作为 `providerSessionId` 回给客户端。
 
----
+**续接时服务会真的切到那个会话**：
+
+1. 从当前 URL 解析出 AWS 账号 ID
+2. 导航到 `/sn/account/<账号ID>/start/chat?conversationId=<sessionId>`
+3. 轮询等 URL 里的 `conversationId` 变成目标值
+4. 再等聊天输入区渲染完成（Quick 是 SPA，切会话后要重新渲染约 2~4 秒）
+5. 然后才填入并发送
+
+如果会话切不过去，会明确报错而不是闷头往错的会话里发消息。
+
+> **注意**：会话 ID 是绑定在 Quick 账号上的。如果你换了 Quick 账号登录
+> （同一个 Chrome profile 里重新登录了别的账号），旧的 `providerSessionId`
+> 就失效了，需要让客户端**新建对话**。
 
 ## 踩过的坑
 
