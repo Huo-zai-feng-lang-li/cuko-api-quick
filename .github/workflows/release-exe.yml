@@ -142,6 +142,10 @@ jobs:
           prerelease: false
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # 必须显式指定，否则只更新 Release 正文、不上传任何附件
+          files: |
+            out/cuko-api-quick-*.exe
+            out/使用说明-*.txt
           body: |
             ## cuko-api-quick ${{ steps.meta.outputs.tag }}
 
