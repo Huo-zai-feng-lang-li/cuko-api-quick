@@ -226,23 +226,31 @@ export async function sendUserMessage(conn, text, cfg, opts = {}) {
 
   const st = await readComposer(conn);
   const hadText = !!String(st.value || '').trim();
-  if (!hadText) {
+  // [261123-attach] 纯附件消息的 textarea 本来就是空的，不能因此判失败
+  if (!hadText && !opts.hasAttachments) {
     await dumpState(conn, '发送前输入区为空');
     return { ok: false, error: '发送前输入区为空（内容可能被页面清掉）' };
   }
+  if (!hadText && opts.hasAttachments) {
+    console.log('[Send] 纯附件消息（输入框为空，但已挂附件），继续发送');
+  }
 
   // 4. 触发发送：优先点按钮，失败回退物理回车
+  //    纯附件消息没有文本可判断「输入框被清空」，只能靠「是否进入生成中」，
+  //    所以等待窗口给宽一点（上传/解析附件后页面才真正开始生成）。
+  const firstWait = opts.hasAttachments ? 12000 : 6000;
+  const retryWait = opts.hasAttachments ? 8000 : 5000;
   let how = 'click';
   let clicked = await clickSendButton(conn);
   console.log('[Send] 点击发送按钮 -> ' + clicked);
-  let sent = await waitSent(conn, hadText, 6000);
+  let sent = await waitSent(conn, hadText, firstWait);
 
   if (!sent.ok) {
     console.warn('[Send] 点击后未确认发送，回退 CDP 回车');
     how = 'enter';
     await focusComposer(conn);
     await pressEnter(conn);
-    sent = await waitSent(conn, hadText, 5000);
+    sent = await waitSent(conn, hadText, retryWait);
   }
 
   if (sent.ok) {
@@ -359,4 +367,92 @@ export async function gotoConversation(conn, conversationId, cfg) {
     await new Promise(r => setTimeout(r, 400));
   }
   return { ok: false, error: '导航超时：' + maxSec + 's 内 URL 未切到目标会话（当前: ' + urlNow + '，目标: ' + conversationId + '）' };
+}
+
+/**
+ * 把本地文件挂到 Quick 的输入区（走页面的 input[type=file]）。
+ *
+ * 实测（2026-11-23）：页面本身就有一个隐藏的 input[type=file]（accept=*、multiple），
+ * 用 CDP 的 DOM.setFileInputFiles 把绝对路径塞进去后，页面会自己走完上传：
+ *   POST .../attachments/presigned-url
+ *   POST .../dlp/internal/.../describe-user-aware
+ *   POST .../invocations/files/upload/<threadId>
+ * 三个都 200 后，输入区上方出现附件卡片，发送时模型能读到文件内容
+ * （已用暗号实测确认：模型准确答出文件里独有的一串字符）。
+ *
+ * @param {object} conn CDP 常驻连接
+ * @param {string[]} filePaths 本地绝对路径
+ * @param {object} cfg 配置方案 values
+ * @returns {Promise<{ok:boolean, error?:string, count?:number}>}
+ */
+export async function attachFiles(conn, filePaths, cfg) {
+  const paths = (filePaths || []).filter(Boolean);
+  if (!paths.length) return { ok: true, count: 0 };
+  if (typeof conn.DOM === 'undefined' || !conn.DOM) {
+    return { ok: false, error: 'CDP DOM 域不可用，无法注入文件' };
+  }
+
+  // 1. 找到那个隐藏的 file input
+  let nodeId = null;
+  try {
+    const doc = await conn.DOM.getDocument({ depth: -1 });
+    const found = await conn.DOM.querySelector({ nodeId: doc.root.nodeId, selector: 'input[type="file"]' });
+    nodeId = found && found.nodeId;
+  } catch (e) {
+    return { ok: false, error: '查找文件输入框失败: ' + e.message };
+  }
+  if (!nodeId) return { ok: false, error: '页面上找不到 input[type=file]（Quick 可能改版了）' };
+
+  // 2. 记录上传请求完成情况，用来确认真的传完了
+  const uploadUrls = new Set();
+  const done = new Set();
+  let scope = null;
+  try {
+    scope = conn.createScope();
+    scope.Network.requestWillBeSent((p) => {
+      const u = (p.request && p.request.url) || '';
+      if (/invocations\/files\/upload|attachments\/presigned-url/i.test(u)) uploadUrls.add(p.requestId);
+    });
+    scope.Network.loadingFinished((p) => {
+      if (uploadUrls.has(p.requestId)) done.add(p.requestId);
+    });
+  } catch (_) {}
+
+  // 3. 注入文件
+  try {
+    await conn.DOM.setFileInputFiles({ nodeId, files: paths });
+    console.log('[Send] 已注入 ' + paths.length + ' 个附件，等待页面上传…');
+  } catch (e) {
+    if (scope) scope.close();
+    return { ok: false, error: '注入文件失败: ' + e.message };
+  }
+
+  // 4. 等上传完成：看到 presigned-url 和 files/upload 都结束，或等附件卡片出现
+  const maxSec = Math.max(30, Math.ceil((cfg && cfg.fileUploadTimeoutSec) || 60));
+  const deadline = Date.now() + maxSec * 1000;
+  let ready = false;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    // 依据 1：上传请求已全部完成
+    const uploadReqDone = [...uploadUrls].some((id) => /upload/i.test(id)) || done.size >= 2;
+    // 依据 2：页面上出现了文件名（附件卡片）
+    let cardSeen = false;
+    try {
+      const names = paths.map((p) => p.split(/[\\/]/).pop()).filter(Boolean);
+      const expr = '(() => { const t = document.body.innerText || ""; return ' +
+        JSON.stringify(names) + '.some(n => t.includes(n)); })()';
+      const r = await conn.Runtime.evaluate({ expression: expr, returnByValue: true });
+      cardSeen = !!(r && r.result && r.result.value);
+    } catch (_) {}
+    if (cardSeen && uploadReqDone) { ready = true; break; }
+    if (cardSeen) ready = true; // 卡片出现就认为挂上了（上传可能已被页面缓存命中）
+  }
+
+  if (scope) scope.close();
+  if (!ready) return { ok: false, error: '附件上传超时（' + maxSec + 's）' };
+
+  // 5. 再给页面一点时间把附件状态同步到发送逻辑
+  await new Promise((r) => setTimeout(r, 800));
+  console.log('[Send] 附件已就绪 ' + paths.length + ' 个');
+  return { ok: true, count: paths.length };
 }

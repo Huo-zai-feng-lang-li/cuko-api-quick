@@ -33,6 +33,9 @@ import { handleChat } from './chat.js';
 import { handleCompress } from './compress.js';
 import { checkAccountHealth } from './health.js';
 import { normalizeInputItems } from './input.js';
+// [261123-attach] 超长文本转附件：客户端发来的工具调用结果动辄几万字符，
+// 直接塞进输入框既慢又容易被页面截断，改成落文件走 Quick 的附件通道。详见 docs/quick-protocol.md
+import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD } from './attachments.js';
 // [261123-port-config] 运行时配置（端口/监听地址）：配置文件 + 环境变量。
 // 双击 exe 的用户没法设环境变量，所以支持改 data/config.json 后重启生效。
 import { resolveRuntimeConfig, ensureRuntimeConfigFile, portInUseHint, RUNTIME_CONFIG_FILE } from './runtime-config.js';
@@ -144,16 +147,42 @@ const server = http.createServer(async (req, res) => {
     // 归一化输入
     const norm = normalizeInputItems(payload.input);
     if (norm.unknown.length) console.warn('[input] 未识别的输入项:', norm.unknown.join(', '));
-    const text = norm.items.filter(i => i.kind === 'text').map(i => i.text).join('\n');
-    const files = norm.items.filter(i => i.kind === 'file');
-    if (!text && !files.length) {
+
+    // [261123-attach] 超过阈值的单个文本项转成附件，正文只留摘要
+    const split = splitOversizedTexts(norm.items, TEXT_TO_FILE_THRESHOLD);
+    const parts = [...split.inlineTexts, ...split.summaryNotes];
+    const text = parts.join('\n\n');
+
+    if (split.files.length) {
+      console.log('[input] ' + split.files.length + ' 个超长文本已转为附件');
+    }
+
+    // [261123-attach] Cuko 的 file 项（base64）落盘后走同一条附件通道
+    const fileItems = norm.items.filter(i => i.kind === 'file');
+    const materialized = materializeFileItems(fileItems);
+    if (materialized.errors.length) {
+      console.warn('[input] 部分文件项处理失败:', materialized.errors.join('; '));
+    }
+    if (materialized.files.length) {
+      console.log('[input] ' + materialized.files.length + ' 个文件项已落盘，将作为附件发送');
+    }
+
+    // 只有文件、没有文本时，给模型一句简短说明，避免「空消息」
+    let finalText = text;
+    if (!finalText && materialized.files.length) {
+      finalText = '【附件】共 ' + materialized.files.length + ' 个文件：' +
+        materialized.files.map(f => f.fileName).join('、') + '，请查看附件内容。';
+    }
+
+    const allFiles = [...split.files, ...materialized.files];
+    if (!finalText && !allFiles.length) {
       sendJson(res, 400, { code: 'invalid_request', message: '输入为空：没有可识别的文本/文件项' });
       return;
     }
-    if (files.length) {
-      console.warn('[input] 本版本暂不支持文件输入，已忽略 ' + files.length + ' 个文件项');
-    }
-    payload._text = text;
+
+    payload._text = finalText;
+    payload._attachFiles = allFiles.map(f => f.filePath);
+    payload._attachMeta = allFiles;
 
     activeModels.add(payload.model);
     const release = () => activeModels.delete(payload.model);

@@ -14,6 +14,7 @@ import {
 } from '../bridge/quick-protocol.js';
 import { parseQuickUrl, buildConversationUrl, isOnConversation, extractThreadIdFromUrl, buildChatUrl } from '../bridge/page.js';
 import { DEFAULT_PROFILE_VALUES } from '../bridge/default-config.js';
+import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD, safeFileName, cleanupAttachments } from '../bridge/attachments.js';
 
 const test = (name, fn) => globalThis.__test(name, fn);
 const assert = globalThis.__assert;
@@ -178,4 +179,67 @@ test('buildChatUrl：没有账号 ID 时兜底到 /sn/start（绝不能是 /sn�
 test('/sn/start 本身解析不出账号，跳转后才有', () => {
   assert.equal(parseQuickUrl('https://quick.aws.com/sn/start').accountId, null);
   assert.equal(parseQuickUrl('https://quick.aws.com/sn/account/261414899405/start/chat').accountId, '261414899405');
+});
+
+// ============ 超长文本转附件 ============
+test('阈值是 20000', () => {
+  assert.equal(TEXT_TO_FILE_THRESHOLD, 20000);
+});
+
+test('不超过阈值的文本原样直发', () => {
+  const r = splitOversizedTexts([{ kind: 'text', text: 'x'.repeat(20000) }]);
+  assert.equal(r.files.length, 0);
+  assert.equal(r.inlineTexts.length, 1);
+});
+
+test('超过阈值转成附件，并生成摘要', () => {
+  const r = splitOversizedTexts([{ kind: 'text', text: 'y'.repeat(20001) }]);
+  assert.equal(r.files.length, 1);
+  assert.equal(r.inlineTexts.length, 0);
+  assert.equal(r.summaryNotes.length, 1);
+  assert.ok(r.summaryNotes[0].includes('已作为附件发送'));
+  cleanupAttachments(r.files);
+});
+
+test('文件名清洗掉 Windows 非法字符', () => {
+  assert.equal(safeFileName('a/b\\c:d*e?f"g<h>i|j'), 'a_b_c_d_e_f_g_h_i_j');
+});
+
+// ============ base64 文件项 ============
+test('base64 文件项落盘且内容一致', () => {
+  const content = '暗号：测试-1234';
+  const r = materializeFileItems([{
+    kind: 'file', filename: 'x.txt', mimeType: 'text/plain',
+    data: Buffer.from(content, 'utf8').toString('base64'),
+  }]);
+  assert.equal(r.files.length, 1);
+  assert.equal(r.errors.length, 0);
+  assert.ok(r.files[0].fileName.endsWith('.txt'), '应保留扩展名');
+  const back = fs.readFileSync(r.files[0].filePath, 'utf8');
+  assert.equal(back, content);
+  cleanupAttachments(r.files);
+});
+
+test('base64 支持 data:URL 前缀', () => {
+  const b64 = Buffer.from('hello', 'utf8').toString('base64');
+  const r = materializeFileItems([{ kind: 'file', filename: 'a.md', data: 'data:text/plain;base64,' + b64 }]);
+  assert.equal(r.files.length, 1);
+  cleanupAttachments(r.files);
+});
+
+test('空 data 与非法 base64 都要报错，不产生垃圾文件', () => {
+  const r1 = materializeFileItems([{ kind: 'file', filename: 'e.txt', data: '' }]);
+  assert.equal(r1.files.length, 0);
+  assert.equal(r1.errors.length, 1);
+
+  const r2 = materializeFileItems([{ kind: 'file', filename: 'b.txt', data: '!!!bad!!!' }]);
+  assert.equal(r2.files.length, 0);
+  assert.equal(r2.errors.length, 1);
+});
+
+test('只用 file 项、text 项不受影响', () => {
+  const b64 = Buffer.from('z', 'utf8').toString('base64');
+  const r = materializeFileItems([{ kind: 'text', text: 'hi' }, { kind: 'file', filename: 'z.txt', data: b64 }]);
+  assert.equal(r.files.length, 1);
+  cleanupAttachments(r.files);
 });

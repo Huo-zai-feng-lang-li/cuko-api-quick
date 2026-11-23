@@ -196,6 +196,27 @@ Cuko 客户端 --HTTP/SSE--> bridge/index.js --CDP--> 独立 Chrome --user-data-
 
 ---
 
+## 八、文件附件（实测）
+
+页面里有一个**隐藏的** `input[type=file]`（`accept=*`、`multiple=true`）。
+用 CDP 的 `DOM.setFileInputFiles` 把本地绝对路径写进去，页面会自动走完整上传：
+
+```
+POST /sn/account/<id>/qbsproxy/qs-file-proxy/accounts/<id>/attachments/presigned-url   ← 200
+POST /sn/account/<id>/qbsproxy/quicksight/dlp/internal/<id>/data-loss-prevention/job/describe-user-aware  ← 200
+POST /sn/account/<id>/qbsproxy/quicksight/accounts/<id>/invocations/files/upload/<threadId>  ← 200
+```
+
+上传成功后输入区上方出现附件卡片，发送时模型能读到文件内容。
+
+**验证方法**：往文件里写一串独有暗号（如 `紫水晶-7788`），问模型暗号是什么。
+实测模型准确答出，说明内容确实被完整读取（而不是只挂了个空卡片）。
+
+**注意**：
+- 必须在 `DOM.enable()` 之后才能用 `setFileInputFiles`
+- 上传是异步的，要等 `files/upload` 返回或附件卡片出现，再点发送
+- 纯附件消息的 textarea 本来就是空的，不能因为「输入框为空」判定发送失败
+
 ## 七、已知限制
 
 - **单账号单并发**：同一账号同时只允许一轮对话（页面上只有一份输入区）。

@@ -29,6 +29,8 @@ class CdpConnection {
     this.Input = null;
     this.Network = null;
     this.Page = null;
+    // [261123-attach] 文件附件要用 DOM.setFileInputFiles 注入，需要 DOM 域
+    this.DOM = null;
     this.alive = false;
     this.connecting = null;
     this.scopes = new Set();
@@ -47,9 +49,12 @@ class CdpConnection {
       this.Input = this.client.Input;
       this.Network = this.client.Network;
       this.Page = this.client.Page;
+      this.DOM = this.client.DOM;
 
       await this.Page.enable();
       await this.Runtime.enable();
+      // [261123-attach] 附件注入依赖 DOM 域
+      await this.DOM.enable();
       await this.Network.enable({
         maxTotalBufferSize: 104857600,
         maxResourceBufferSize: 52428800,

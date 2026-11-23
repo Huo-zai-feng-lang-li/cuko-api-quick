@@ -152,6 +152,34 @@ Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件
 ```
 全程 17.5s，客户端无报错。
 
+### 261123-attach：超长文本转附件 + 支持 Cuko 文件项
+
+**背景**：Cuko 客户端会把工具调用结果当普通文本发来，动辄几万字符。
+直接塞输入框又慢又容易被页面截断。
+
+**可行性验证（先做再写代码）**：
+发现页面里有隐藏的 `input[type=file]`，用 CDP `DOM.setFileInputFiles` 注入后，
+页面自己走完 presigned-url → DLP → files/upload。然后往文件里埋暗号问模型，
+模型准确答出 —— 确认附件内容能被读到，方案成立。
+
+**实现**：
+- 新增 `bridge/attachments.js`：超长文本落盘（阈值 20000 字符）、
+  base64 文件项落盘、文件名清洗、临时文件清理
+- `quick-sender.js` 新增 `attachFiles()`：注入文件 → 等上传完成 → 等附件卡片
+- `cdp-connection.js` 暴露 DOM 域（原本只有 Runtime/Input/Network/Page）
+- `chat.js` 发送前挂附件，结束后清理临时文件
+- `index.js` 接分流逻辑，不再丢弃 file 项
+
+**边界处理**：
+- base64 做字符集校验 + 回编码比对，非法数据报错而不是写垃圾文件
+- 空 data、data:URL 前缀、无扩展名、300KB 大文件都覆盖到
+
+**验收**（真机 E2E，四种输入）：
+① 普通短文本 ✅  ② 续接上下文 ✅
+③ 24014 字符转附件，模型答出暗号 ✅  ④ base64 文件项，模型答出暗号 ✅
+
+测试：28 项单测全过（新增 8 项覆盖分流与 base64）。
+
 ## 遗留
 
 - **文件/图片输入**：Quick 的附件走独立的 `upload-attachment` → DLP 扫描 → `files/upload` 流程，

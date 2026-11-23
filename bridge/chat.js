@@ -12,7 +12,8 @@
  */
 import { QuickTurnExtractor } from './quick-protocol.js';
 import { QuickChannel } from './quick-transport.js';
-import { sendUserMessage, waitForComposer, startNewChat, gotoConversation, isGenerating, currentUrl } from './quick-sender.js';
+import { sendUserMessage, waitForComposer, startNewChat, gotoConversation, attachFiles, isGenerating, currentUrl } from './quick-sender.js';
+import { cleanupAttachments } from './attachments.js';
 import { extractThreadIdFromUrl, parseQuickUrl } from './page.js';
 
 const IDLE_TIMEOUT_MS = 120000;   // 连续 120s 无任何聊天事件 → 判定卡死
@@ -148,6 +149,10 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
     } catch (_) {}
 
     log('本轮结束：正文 ' + extractor.text.length + ' 字，思考 ' + extractor.think.length + ' 字，事件 ' + JSON.stringify(extractor.eventCounts));
+    // [261123-attach] 清理本轮生成的临时附件，避免磁盘堆积
+    if (Array.isArray(payload._attachMeta) && payload._attachMeta.length) {
+      cleanupAttachments(payload._attachMeta);
+    }
     release();
   };
 
@@ -261,8 +266,18 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
     // 客户端断开后不要再往页面里打字，避免污染会话
     if (aborted) throw new Error('客户端已断开，中止发送');
 
+    // [261123-attach] 先挂附件再填正文：页面在上传完成前不接受发送按钮点击
+    const attachPaths = Array.isArray(payload._attachFiles) ? payload._attachFiles : [];
+    if (attachPaths.length) {
+      log('挂载 ' + attachPaths.length + ' 个附件…');
+      const at = await attachFiles(conn, attachPaths, cfg);
+      if (!at.ok) throw new Error('附件上传失败: ' + at.error);
+      log('附件已就绪');
+    }
+
     const r = await sendUserMessage(conn, payload._text, cfg, {
       skipPreEnterWait: payload.type === 'user',
+      hasAttachments: attachPaths.length > 0,
     });
     if (!r.ok) throw new Error(r.error || '发送失败');
     log('消息已发出，等待 Quick 响应…');
