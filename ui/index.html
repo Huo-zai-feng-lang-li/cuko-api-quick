@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cuko-api-quick 管理台</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
@@ -206,8 +207,7 @@ async function renameAccount(id) {
 }
 
 async function delAccount(id) {
-  if (!confirm('删除账号 ' + id + '？
-会同时删除它的 Chrome 用户数据目录（登录态），不可恢复。')) return;
+  if (!confirm('删除账号 ' + id + '？\n会同时删除它的 Chrome 用户数据目录（登录态），不可恢复。')) return;
   try { await api('DELETE', '/api/accounts/' + encodeURIComponent(id)); toast('已删除', 'ok'); loadAccounts(); }
   catch (e) { toast(e.message, 'err'); }
 }
@@ -286,10 +286,12 @@ async function delProfile(id) {
 // ---------- 初始化 ----------
 $('#endpoint').textContent = API;
 $('#ep2').textContent = API;
-$('#curlSample').textContent =
-  'curl ' + API + '/v1/responses \\\n'
-  + '  -H "Content-Type: application/json" \\\n'
-  + '  -d \'{"model":"<模型ID>","requestId":"req-1","cuckSessionId":"cuck-1","input":[{"type":"text","text":"你好"}]}\'';
+$('#curlSample').textContent = [
+  'curl ' + API + '/v1/responses',
+  '  -H "Content-Type: application/json"',
+  '  -d \'{"model":"<模型ID>","requestId":"req-1","cuckSessionId":"cuck-1","input":[{"type":"text","text":"你好"}]}\'',
+].join(' \\\n');
+
 loadProfiles();
 loadAccounts();
 setInterval(loadAccounts, 8000);
