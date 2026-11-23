@@ -209,6 +209,26 @@ Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件
 - 真机长任务：80.3 秒、中间连续 39 秒无事件，正常完成 4386 字，
   心跳在 20/40/60 秒准时发出
 
+### 261123-open-admin：启动后自动打开管理后台
+
+**背景**：exe 双击启动后只弹一个命令行窗口，用户不知道该去浏览器敲地址。
+
+**实现**：
+- 新增 `bridge/open-browser.js`：三级兜底打开默认浏览器
+  1. `cmd /c start "" "<url>"`（最轻量）
+  2. `rundll32 url.dll,FileProtocolHandler`
+  3. PowerShell `Start-Process`
+  任一成功即可，全部失败只打日志、不影响服务
+- `runtime-config.js` 增加 `autoOpenAdmin` 开关（默认 true），
+  支持 true/false/"false"/0/1 多种写法归一化
+- `index.js` 在 listen 回调里触发
+
+**验证**：
+- 启动日志出现「已尝试打开管理台」，Chrome 窗口标题确认为
+  `cuko-api-quick 管理台` —— 浏览器确实被打开了
+- `autoOpenAdmin: false` 时不打开，日志提示手动访问
+- 值归一化 7 种输入全部正确（含缺省、空配置、文件不存在时回退默认 true）
+
 ## 遗留
 
 - **文件/图片输入**：Quick 的附件走独立的 `upload-attachment` → DLP 扫描 → `files/upload` 流程，

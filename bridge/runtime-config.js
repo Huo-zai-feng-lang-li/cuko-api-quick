@@ -22,6 +22,8 @@ export const DEFAULT_RUNTIME_CONFIG = Object.freeze({
   port: 3000,
   /** 监听地址；默认只本机可访问，改成 0.0.0.0 可让局域网访问（不推荐，无鉴权） */
   host: '127.0.0.1',
+  /** 启动后是否自动用默认浏览器打开管理后台 */
+  autoOpenAdmin: true,
 });
 
 /**
@@ -49,10 +51,13 @@ export function ensureRuntimeConfigFile() {
         'port：HTTP 监听端口，默认 3000。客户端里的「API 地址」要填成一样的端口。',
         'host：监听地址，默认 127.0.0.1（只有本机能访问）。',
         '      改成 0.0.0.0 可以让局域网访问，但本项目没有鉴权，请自行评估风险。',
+        'autoOpenAdmin：启动后是否自动打开管理后台页面，默认 true。',
+        '      如果你把服务跑在服务器上、或者不想每次弹浏览器，改成 false。',
         '环境变量 CUKO_HTTP_PORT 优先级高于本文件。',
       ],
       port: DEFAULT_RUNTIME_CONFIG.port,
       host: DEFAULT_RUNTIME_CONFIG.host,
+      autoOpenAdmin: DEFAULT_RUNTIME_CONFIG.autoOpenAdmin,
     };
     fs.writeFileSync(RUNTIME_CONFIG_FILE, JSON.stringify(body, null, 2), 'utf8');
     return true;
@@ -71,6 +76,7 @@ export function resolveRuntimeConfig() {
   const file = readRuntimeConfig();
   let port = DEFAULT_RUNTIME_CONFIG.port;
   let host = DEFAULT_RUNTIME_CONFIG.host;
+  let autoOpenAdmin = DEFAULT_RUNTIME_CONFIG.autoOpenAdmin;
   let portSource = '默认值';
 
   // 1) 配置文件
@@ -89,7 +95,13 @@ export function resolveRuntimeConfig() {
     else console.warn('[config] 环境变量 CUKO_HTTP_PORT 不合法（' + JSON.stringify(envPort) + '），已忽略');
   }
 
-  return { port, host, portSource };
+  // 布尔开关：字符串 'false' 也当 false 处理（方便手工编辑 json）
+  if (file.autoOpenAdmin !== undefined) {
+    const v = file.autoOpenAdmin;
+    autoOpenAdmin = !(v === false || v === 'false' || v === 0 || v === '0');
+  }
+
+  return { port, host, portSource, autoOpenAdmin };
 }
 
 /** 端口被占用时给用户的建议（写进错误信息里） */

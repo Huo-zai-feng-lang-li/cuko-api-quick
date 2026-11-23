@@ -39,6 +39,8 @@ import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD } fro
 // [261123-port-config] 运行时配置（端口/监听地址）：配置文件 + 环境变量。
 // 双击 exe 的用户没法设环境变量，所以支持改 data/config.json 后重启生效。
 import { resolveRuntimeConfig, ensureRuntimeConfigFile, portInUseHint, RUNTIME_CONFIG_FILE } from './runtime-config.js';
+// [261123-open-admin] 启动后自动打开管理后台
+import { openInBrowser } from './open-browser.js';
 
 const BASE_DEBUG_PORT = 9222;
 
@@ -399,12 +401,24 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-server.listen(HTTP_PORT, HTTP_HOST, () => {
+server.listen(HTTP_PORT, HTTP_HOST, async () => {
+  const adminUrl = 'http://127.0.0.1:' + HTTP_PORT + '/';
   console.log('[Cuko Provider] 运行在 http://' + HTTP_HOST + ':' + HTTP_PORT + (runtimeCfg.portSource === '默认值' ? '' : '（端口来源：' + runtimeCfg.portSource + '）'));
-  console.log('[Cuko Provider] 管理台: http://127.0.0.1:' + HTTP_PORT + '/');
+  console.log('[Cuko Provider] 管理台: ' + adminUrl);
   console.log('[Cuko Provider] 配置文件: ' + RUNTIME_CONFIG_FILE);
   const chrome = resolveChromePath(DEFAULT_PROFILE_VALUES);
   if (!chrome) console.warn('[Cuko Provider] 未探测到 Chrome，请在配置方案里指定 chromePath');
+
+  // [261123-open-admin] 自动打开管理后台。
+  // 监听地址是 0.0.0.0 时，日志里仍用 127.0.0.1 拼地址（本机浏览器能访问）。
+  // 打开失败不影响服务，只提示手动访问。
+  if (runtimeCfg.autoOpenAdmin) {
+    const ok = await openInBrowser(adminUrl);
+    if (ok) console.log('[Cuko Provider] 已尝试打开管理台（若没弹出请手动访问上面的地址）');
+    else console.warn('[Cuko Provider] 自动打开浏览器失败，请手动访问: ' + adminUrl);
+  } else {
+    console.log('[Cuko Provider] autoOpenAdmin 已关闭，请手动打开上面的地址');
+  }
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) {

@@ -14,6 +14,7 @@ import {
 } from '../bridge/quick-protocol.js';
 import { parseQuickUrl, buildConversationUrl, isOnConversation, extractThreadIdFromUrl, buildChatUrl } from '../bridge/page.js';
 import { DEFAULT_PROFILE_VALUES, validateProfile } from '../bridge/default-config.js';
+import { DEFAULT_RUNTIME_CONFIG } from '../bridge/runtime-config.js';
 import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD, safeFileName, cleanupAttachments } from '../bridge/attachments.js';
 
 const test = (name, fn) => globalThis.__test(name, fn);
@@ -269,4 +270,15 @@ test('新字段拒绝负数', () => {
   let threw = false;
   try { validateProfile({ idleTimeoutSec: -1 }); } catch { threw = true; }
   assert.ok(threw, '负数应该被拒绝');
+});
+
+// ============ 启动后自动打开管理后台 ============
+test('autoOpenAdmin 默认开启', () => {
+  assert.equal(DEFAULT_RUNTIME_CONFIG.autoOpenAdmin, true);
+});
+
+test('openInBrowser 是函数且空 URL 直接返回 false', async () => {
+  const { openInBrowser } = await import('../bridge/open-browser.js');
+  assert.equal(typeof openInBrowser, 'function');
+  assert.equal(await openInBrowser(''), false);
 });
