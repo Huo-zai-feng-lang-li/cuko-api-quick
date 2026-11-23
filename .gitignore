@@ -1,8 +1,9 @@
-# 运行时数据（账号、Chrome 用户目录、日志、历史）
+# 运行时数据（账号、Chrome 用户目录、日志）
 data/
 # 依赖
 node_modules/
 # 构建产物
+build/
 dist/
 # 日志
 *.log

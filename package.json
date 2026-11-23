@@ -6,12 +6,19 @@
   "scripts": {
     "start": "node bridge/index.js",
     "test": "node test/run.mjs",
-    "docs:index": "node scripts/build-docs-index.mjs"
+    "docs:index": "node scripts/build-docs-index.mjs",
+    "build:exe": "node scripts/build-exe.mjs"
   },
   "dependencies": {
     "chrome-remote-interface": "^0.34.0"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }

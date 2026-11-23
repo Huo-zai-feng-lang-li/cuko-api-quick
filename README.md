@@ -19,6 +19,7 @@
 - [它是怎么工作的](#它是怎么工作的)
 - [踩过的坑](#踩过的坑)
 - [目录结构](#目录结构)
+- [打包成 exe](#打包成-exe)
 - [验证](#验证)
 - [已知限制](#已知限制)
 - [免责声明](#免责声明)
@@ -57,6 +58,8 @@ Cuko 客户端 ──HTTP/SSE──▶ bridge ──CDP──▶ 独立 Chrome �
 
 ### 安装与启动
 
+**方式 A：源码运行**
+
 ```bash
 npm install
 npm start
@@ -67,6 +70,11 @@ npm start
 ```bash
 CUKO_HTTP_PORT=3002 npm start
 ```
+
+**方式 B：单文件 exe**
+
+下载或自行构建 `cuko-api-quick.exe`（见[打包成 exe](#打包成-exe)），双击运行即可，不需要装 Node。
+数据都在 exe 同级的 `data/` 目录。
 
 ### 添加账号并登录
 
@@ -339,6 +347,33 @@ data/                   运行时数据（.gitignore）
 ```
 
 ---
+
+## 打包成 exe
+
+需要 Node.js >= 25.5（内置 `--build-sea`），在 Windows 上构建：
+
+```bash
+npm install
+npm run build:exe
+```
+
+产物：
+
+```
+dist/
+  cuko-api-quick.exe   约 100 MB，自带 Node 运行时，目标机不用装 Node
+  使用说明.txt          给最终用户的说明
+```
+
+- `ui/index.html` 作为 SEA asset 内嵌进 exe；`data/` 不打进去，首次运行在 exe 同目录自动创建。
+- 路径基准统一由 `bridge/app-paths.js` 计算：开发时是项目根，打包后是 exe 所在目录。
+- `bufferutil` / `utf-8-validate` 是 ws 的可选加速模块，不打包，运行时会自动回退 JS 实现。
+- exe 未签名，SmartScreen 提示时选择「更多信息 → 仍要运行」。
+
+> 构建脚本会自动找一个支持 `--build-sea` 的 node（本机 `process.execPath` 若是
+> 不支持该参数的版本，会去 PATH / Program Files 里找）。也可用环境变量
+> `NODE_SEA_BIN` 显式指定。
+
 
 ## 验证
 
