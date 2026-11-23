@@ -33,11 +33,17 @@ import { handleChat } from './chat.js';
 import { handleCompress } from './compress.js';
 import { checkAccountHealth } from './health.js';
 import { normalizeInputItems } from './input.js';
+// [261123-port-config] 运行时配置（端口/监听地址）：配置文件 + 环境变量。
+// 双击 exe 的用户没法设环境变量，所以支持改 data/config.json 后重启生效。
+import { resolveRuntimeConfig, ensureRuntimeConfigFile, portInUseHint, RUNTIME_CONFIG_FILE } from './runtime-config.js';
 
-const HTTP_PORT = Number(process.env.CUKO_HTTP_PORT) || 3000;
 const BASE_DEBUG_PORT = 9222;
 
 ensureDataDirs();
+const runtimeCfg = resolveRuntimeConfig();
+const HTTP_PORT = runtimeCfg.port;
+const HTTP_HOST = runtimeCfg.host;
+if (ensureRuntimeConfigFile()) console.log('[config] 已生成默认配置文件:', RUNTIME_CONFIG_FILE);
 const LOG_FILE = initLogFile();
 teeConsoleToFile();
 console.log('[bridge] 日志落盘:', LOG_FILE);
@@ -79,6 +85,20 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(500); res.end('管理页读取失败: ' + e.message);
     }
+    return;
+  }
+
+  // [261123-port-config] 让管理台能显示「当前实际监听地址」，
+  // 用户改完端口不知道填什么时可对照。
+  if (req.method === 'GET' && pathname === '/api/info') {
+    sendJson(res, 200, {
+      port: HTTP_PORT,
+      host: HTTP_HOST,
+      baseUrl: 'http://127.0.0.1:' + HTTP_PORT,
+      portSource: runtimeCfg.portSource,
+      configFile: RUNTIME_CONFIG_FILE,
+      version: (() => { try { return JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')).version; } catch { return '0.1.0'; } })(),
+    });
     return;
   }
 
@@ -335,9 +355,24 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { code: 'invalid_request', message: 'Not Found' });
 });
 
-server.listen(HTTP_PORT, '127.0.0.1', () => {
-  console.log('[Cuko Provider] 运行在 http://127.0.0.1:' + HTTP_PORT);
+// [261123-port-config] 端口被占用时不要甩一堆栈，直接给出可操作的解决步骤
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error('\n[Cuko Provider] ' + portInUseHint(HTTP_PORT) + '\n');
+    process.exit(1);
+  }
+  if (err && err.code === 'EACCES') {
+    console.error('\n[Cuko Provider] 没有权限监听端口 ' + HTTP_PORT + '。请换一个 1024 以上的端口：编辑 ' + RUNTIME_CONFIG_FILE + '\n');
+    process.exit(1);
+  }
+  console.error('\n[Cuko Provider] 启动失败:', err && err.message, '\n');
+  process.exit(1);
+});
+
+server.listen(HTTP_PORT, HTTP_HOST, () => {
+  console.log('[Cuko Provider] 运行在 http://' + HTTP_HOST + ':' + HTTP_PORT + (runtimeCfg.portSource === '默认值' ? '' : '（端口来源：' + runtimeCfg.portSource + '）'));
   console.log('[Cuko Provider] 管理台: http://127.0.0.1:' + HTTP_PORT + '/');
+  console.log('[Cuko Provider] 配置文件: ' + RUNTIME_CONFIG_FILE);
   const chrome = resolveChromePath(DEFAULT_PROFILE_VALUES);
   if (!chrome) console.warn('[Cuko Provider] 未探测到 Chrome，请在配置方案里指定 chromePath');
 });

@@ -286,6 +286,22 @@ async function delProfile(id) {
 // ---------- 初始化 ----------
 $('#endpoint').textContent = API;
 $('#ep2').textContent = API;
+
+// 从 /api/info 拉真实监听信息（端口可能被配置文件/环境变量改过）
+api('GET', '/api/info').then(info => {
+  const base = info.baseUrl || API;
+  $('#endpoint').textContent = base;
+  $('#ep2').textContent = base;
+  if (info.portSource && info.portSource !== '默认值') {
+    $('#endpoint').textContent = base + '（端口来源：' + info.portSource + '）';
+  }
+  // 调用示例也随之更新
+  $('#curlSample').textContent = [
+    'curl ' + base + '/v1/responses',
+    '  -H "Content-Type: application/json"',
+    '  -d \'{"model":"<模型ID>","requestId":"req-1","cuckSessionId":"cuck-1","input":[{"type":"text","text":"你好"}]}\'',
+  ].join(' \\\n');
+}).catch(() => {});
 $('#curlSample').textContent = [
   'curl ' + API + '/v1/responses',
   '  -H "Content-Type: application/json"',
