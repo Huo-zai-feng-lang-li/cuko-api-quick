@@ -123,7 +123,7 @@ jobs:
           $tag = "${{ steps.meta.outputs.tag }}"
           New-Item -ItemType Directory -Force -Path out | Out-Null
           Copy-Item "dist/cuko-api-quick.exe" "out/cuko-api-quick-$tag.exe"
-          Copy-Item "dist/使用说明.txt" "out/使用说明-$tag.txt"
+          Copy-Item "dist/使用说明.txt" "out/README-$tag.txt"
           Get-ChildItem out | Format-Table Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
 
       - name: 上传工作流产物
@@ -145,7 +145,7 @@ jobs:
           # 必须显式指定，否则只更新 Release 正文、不上传任何附件
           files: |
             out/cuko-api-quick-*.exe
-            out/使用说明-*.txt
+            out/README-*.txt
           body: |
             ## cuko-api-quick ${{ steps.meta.outputs.tag }}
 
