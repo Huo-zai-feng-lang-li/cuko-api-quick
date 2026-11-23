@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cuko-api-quick 管理台</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --text: #e6e9ef; --muted: #8b93a3; --accent: #4f8cff; --ok: #37c07a;
+    --warn: #e0a33e; --err: #e05252;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    padding: 18px 24px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; }
+  main { padding: 20px 24px 60px; max-width: 1180px; }
+  section { margin-bottom: 26px; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input, select, textarea {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 7px; padding: 7px 9px; font: inherit; font-size: 13px; min-width: 140px;
+  }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+    padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+  button.danger { background: var(--err); }
+  button.small { padding: 4px 9px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; }
+  .pill.online { background: rgba(55,192,122,.15); color: var(--ok); }
+  .pill.offline { background: rgba(224,82,82,.15); color: var(--err); }
+  .pill.muted { background: rgba(139,147,163,.15); color: var(--muted); }
+  .pill.warn { background: rgba(224,163,62,.15); color: var(--warn); }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; padding: 11px 16px; border-radius: 9px;
+    background: var(--panel2); border: 1px solid var(--line); opacity: 0;
+    transition: opacity .2s; pointer-events: none; max-width: 420px;
+  }
+  .toast.show { opacity: 1; }
+  .toast.ok { border-color: var(--ok); } .toast.err { border-color: var(--err); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }
+  code { background: var(--panel2); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cuko-api-quick</h1>
+  <span class="sub">Amazon Quick 网页版 → Cuko API</span>
+  <span class="sub" id="endpoint"></span>
+</header>
+
+<main>
+  <section>
+    <h2>账号（每个账号 = 一个模型 = 一个独立 Chrome）</h2>
+    <div class="card">
+      <div class="row">
+        <div><label>模型 ID（英文/数字/下划线/中划线）</label><input id="accId" placeholder="quick-main"></div>
+        <div><label>显示名称</label><input id="accName" placeholder="Quick 主账号"></div>
+        <div><label>配置方案</label><select id="accProfile"></select></div>
+        <button onclick="addAccount()">添加并启动 Chrome</button>
+      </div>
+      <div class="hint">添加后会自动启动一个独立 Chrome 窗口，请在其中登录 quick.aws.com。每个账号有独立的用户数据目录与调试端口。</div>
+    </div>
+    <div class="card" style="margin-top:12px;padding:0">
+      <table>
+        <thead><tr>
+          <th>模型 ID</th><th>名称</th><th>端口</th><th>状态</th><th>方案</th><th>健康</th><th style="width:260px">操作</th>
+        </tr></thead>
+        <tbody id="accRows"><tr><td colspan="7" class="hint">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>配置方案（行为参数）</h2>
+    <div class="card">
+      <div class="row">
+        <div><label>方案名称</label><input id="profName" placeholder="我的方案"></div>
+        <button onclick="addProfile()">从默认方案复制新建</button>
+        <button class="ghost" onclick="loadProfiles()">刷新</button>
+      </div>
+      <div class="hint">默认方案不可修改。新建的方案从默认值深拷贝，之后默认方案变化不影响已建方案。</div>
+    </div>
+    <div id="profList" style="margin-top:12px"></div>
+  </section>
+
+  <section>
+    <h2>调用方式</h2>
+    <div class="card">
+      <div class="hint" style="margin-top:0">
+        中转地址 <code id="ep2"></code>，Token 留空，模型选择上面账号的「模型 ID」。
+      </div>
+      <pre style="background:var(--panel2);padding:12px;border-radius:8px;overflow:auto;font-size:12px"><code id="curlSample"></code></pre>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const API = location.origin;
+let PROFILES = { default: null, profiles: [], labels: {} };
+
+function toast(msg, kind) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (kind || '');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => { t.className = 'toast'; }, 3600);
+}
+
+async function api(method, path, body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const r = await fetch(API + path, opt);
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+  if (!r.ok) throw new Error((data && (data.error || data.message)) || (typeof data === 'string' ? data : r.status));
+  return data;
+}
+
+// ---------- 账号 ----------
+async function loadAccounts() {
+  const rows = $('#accRows');
+  try {
+    const list = await api('GET', '/api/accounts');
+    if (!list.length) { rows.innerHTML = '<tr><td colspan="7" class="hint">还没有账号，先在上面添加一个。</td></tr>'; return; }
+    rows.innerHTML = list.map(a => {
+      const health = a.health ? (a.health.state || '-') : '-';
+      const healthCls = health === 'ok' ? 'online' : (health === 'login_required' ? 'warn' : (health === '-' ? 'muted' : 'offline'));
+      return '<tr>'
+        + '<td><code>' + esc(a.modelId) + '</code></td>'
+        + '<td>' + esc(a.modelName || '') + '</td>'
+        + '<td>' + a.debugPort + '</td>'
+        + '<td><span class="pill ' + (a.status === 'online' ? 'online' : 'offline') + '">' + (a.status === 'online' ? '运行中' : '未运行') + '</span></td>'
+        + '<td>' + esc(a.profileName || '默认方案') + '</td>'
+        + '<td><span class="pill ' + healthCls + '">' + esc(health) + '</span></td>'
+        + '<td>'
+        + '<button class="small ghost" onclick="openAccount(\'' + esc(a.modelId) + '\')">打开</button> '
+        + '<button class="small ghost" onclick="checkHealth(\'' + esc(a.modelId) + '\')">检查</button> '
+        + '<button class="small ghost" onclick="renameAccount(\'' + esc(a.modelId) + '\')">改名</button> '
+        + '<button class="small danger" onclick="delAccount(\'' + esc(a.modelId) + '\')">删除</button>'
+        + '</td></tr>';
+    }).join('');
+  } catch (e) {
+    rows.innerHTML = '<tr><td colspan="7" class="hint" style="color:var(--err)">' + esc(e.message) + '</td></tr>';
+  }
+}
+
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function addAccount() {
+  const modelId = $('#accId').value.trim();
+  const modelName = $('#accName').value.trim() || modelId;
+  const profileId = $('#accProfile').value;
+  if (!modelId) return toast('请填写模型 ID', 'err');
+  try {
+    await api('POST', '/api/accounts', { modelId, modelName, profileId });
+    $('#accId').value = ''; $('#accName').value = '';
+    toast('已添加，Chrome 正在启动', 'ok');
+    setTimeout(loadAccounts, 1200);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function openAccount(id) {
+  try { await api('POST', '/api/accounts/' + encodeURIComponent(id) + '/open'); toast('已启动 Chrome', 'ok'); setTimeout(loadAccounts, 1200); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+async function checkHealth(id) {
+  toast('检查中…');
+  try {
+    const r = await api('GET', '/api/accounts/' + encodeURIComponent(id) + '/health');
+    toast(id + ' → ' + r.state + (r.message ? '：' + r.message : ''), r.state === 'ok' ? 'ok' : 'err');
+    loadAccounts();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function renameAccount(id) {
+  const name = prompt('新的显示名称', id);
+  if (name == null) return;
+  try { await api('PUT', '/api/accounts/' + encodeURIComponent(id), { modelName: name.trim() }); toast('已更新', 'ok'); loadAccounts(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+async function delAccount(id) {
+  if (!confirm('删除账号 ' + id + '？
+会同时删除它的 Chrome 用户数据目录（登录态），不可恢复。')) return;
+  try { await api('DELETE', '/api/accounts/' + encodeURIComponent(id)); toast('已删除', 'ok'); loadAccounts(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+// ---------- 配置方案 ----------
+async function loadProfiles() {
+  try {
+    PROFILES = await api('GET', '/api/profiles');
+    const sel = $('#accProfile');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="default">默认方案</option>'
+      + PROFILES.profiles.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('');
+    if (cur) sel.value = cur;
+    renderProfiles();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function renderProfiles() {
+  const labels = PROFILES.labels || {};
+  const all = [PROFILES.default].concat(PROFILES.profiles || []);
+  $('#profList').innerHTML = all.map(p => {
+    const fields = Object.keys(p.values || {}).map(k => {
+      const v = p.values[k];
+      const label = labels[k] || k;
+      if (typeof v === 'boolean') {
+        return '<div><label>' + esc(label) + '</label>'
+          + '<select data-prof="' + esc(p.id) + '" data-key="' + esc(k) + '"' + (p.isDefault ? ' disabled' : '') + '>'
+          + '<option value="true"' + (v ? ' selected' : '') + '>开启</option>'
+          + '<option value="false"' + (!v ? ' selected' : '') + '>关闭</option></select></div>';
+      }
+      return '<div><label>' + esc(label) + '</label>'
+        + '<input data-prof="' + esc(p.id) + '" data-key="' + esc(k) + '" value="' + esc(v) + '"' + (p.isDefault ? ' disabled' : '') + '></div>';
+    }).join('');
+    return '<div class="card" style="margin-bottom:10px">'
+      + '<div class="row"><strong>' + esc(p.name) + '</strong>'
+      + (p.isDefault ? '<span class="pill muted">默认（只读）</span>' : '')
+      + (p.isDefault ? '' : '<button class="small" onclick="saveProfile(\'' + esc(p.id) + '\')">保存</button>'
+        + '<button class="small danger" onclick="delProfile(\'' + esc(p.id) + '\')">删除</button>')
+      + '</div>'
+      + '<details' + (p.isDefault ? '' : '') + '><summary>展开参数（' + Object.keys(p.values || {}).length + ' 项）</summary>'
+      + '<div class="fields">' + fields + '</div></details>'
+      + '</div>';
+  }).join('');
+}
+
+function collectValues(profId) {
+  const out = {};
+  document.querySelectorAll('[data-prof="' + profId + '"]').forEach(el => {
+    const k = el.getAttribute('data-key');
+    let v = el.value;
+    if (v === 'true') v = true; else if (v === 'false') v = false;
+    else if (v !== '' && !isNaN(Number(v))) v = Number(v);
+    out[k] = v;
+  });
+  return out;
+}
+
+async function addProfile() {
+  const name = $('#profName').value.trim();
+  if (!name) return toast('请填写方案名称', 'err');
+  try { await api('POST', '/api/profiles', { name }); $('#profName').value = ''; toast('已创建', 'ok'); loadProfiles(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+async function saveProfile(id) {
+  try { await api('PUT', '/api/profiles/' + encodeURIComponent(id), { values: collectValues(id) }); toast('已保存', 'ok'); loadProfiles(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+async function delProfile(id) {
+  if (!confirm('删除该配置方案？使用它的账号会回退到默认方案。')) return;
+  try { await api('DELETE', '/api/profiles/' + encodeURIComponent(id)); toast('已删除', 'ok'); loadProfiles(); loadAccounts(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+// ---------- 初始化 ----------
+$('#endpoint').textContent = API;
+$('#ep2').textContent = API;
+$('#curlSample').textContent =
+  'curl ' + API + '/v1/responses \\\n'
+  + '  -H "Content-Type: application/json" \\\n'
+  + '  -d \'{"model":"<模型ID>","requestId":"req-1","cuckSessionId":"cuck-1","input":[{"type":"text","text":"你好"}]}\'';
+loadProfiles();
+loadAccounts();
+setInterval(loadAccounts, 8000);
+</script>
+</body>
+</html>

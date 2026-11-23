@@ -1,0 +1,16 @@
+# 运行时数据（账号、Chrome 用户目录、日志、历史）
+data/
+# 依赖
+node_modules/
+# 构建产物
+dist/
+# 日志
+*.log
+# IDE
+.idea/
+.vscode/
+# 系统
+Thumbs.db
+.DS_Store
+# 测试运行产物
+test/last-run.txt

@@ -1,0 +1,351 @@
+/**
+ * cuko-api-quick —— 把 Amazon Quick（quick.aws.com）网页版聊天，暴露成 Cuko API
+ *
+ * 架构：
+ *   客户端 --(HTTP/SSE)--> bridge/index.js --(CDP)--> 独立 Chrome --user-data-dir--> quick.aws.com
+ *
+ * 端点：
+ *   GET  /v1/models                      模型（账号）列表
+ *   POST /v1/responses                   发送消息（SSE 流式）
+ *   GET  /api/accounts                   账号列表
+ *   POST /api/accounts                   新增账号（自动启动 Chrome）
+ *   PUT  /api/accounts/:id               改名 / 绑配置方案
+ *   DELETE /api/accounts/:id             删除账号（含独立数据目录）
+ *   POST /api/accounts/:id/open          打开 Chrome
+ *   GET  /api/accounts/:id/health        账号健康检查
+ *   GET  /api/profiles                   配置方案
+ *   POST /api/profiles                   新建方案
+ *   PUT  /api/profiles/:id               修改方案
+ *   DELETE /api/profiles/:id             删除方案
+ *
+ * 协议见 docs/cuko-api-v1.md，Quick 侧细节见 docs/quick-protocol.md。
+ */
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { getAccounts, saveAccounts, getProfiles, saveProfiles, resolveProfile,
+  ensureDataDirs, initLogFile, teeConsoleToFile, PROFILES_DIR, getAccountHealth, saveAccountHealth } from './store.js';
+import { DEFAULT_PROFILE_VALUES, FIELD_LABELS, validateProfile } from './default-config.js';
+import { readUiIndexHtml } from './app-paths.js';
+import { launchChrome, probePort, resolveChromePath } from './chrome.js';
+import { getConnection, closeConnection, closeAllConnections } from './cdp-connection.js';
+import { handleChat } from './chat.js';
+import { handleCompress } from './compress.js';
+import { checkAccountHealth } from './health.js';
+import { normalizeInputItems } from './input.js';
+
+const HTTP_PORT = Number(process.env.CUKO_HTTP_PORT) || 3000;
+const BASE_DEBUG_PORT = 9222;
+
+ensureDataDirs();
+const LOG_FILE = initLogFile();
+teeConsoleToFile();
+console.log('[bridge] 日志落盘:', LOG_FILE);
+
+/** 每个模型同一时间只允许一轮对话 */
+const activeModels = new Set();
+
+/** 统一的 JSON 响应 */
+function sendJson(res, status, obj) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+
+/** 读取请求体 */
+async function readBody(req) {
+  let body = '';
+  req.setEncoding('utf8');
+  for await (const chunk of req) body += chunk;
+  return body;
+}
+
+/** 分配调试端口（当前最大值 +1） */
+function allocDebugPort(accounts) {
+  let maxPort = BASE_DEBUG_PORT;
+  for (const a of accounts) if (a.debugPort && a.debugPort > maxPort) maxPort = a.debugPort;
+  return maxPort + 1;
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1');
+  const pathname = url.pathname;
+
+  // 管理台
+  if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+    try {
+      const html = readUiIndexHtml();
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (e) {
+      res.writeHead(500); res.end('管理页读取失败: ' + e.message);
+    }
+    return;
+  }
+
+  // ============ Cuko API ============
+  if (req.method === 'GET' && pathname === '/v1/models') {
+    const accounts = getAccounts();
+    sendJson(res, 200, {
+      data: accounts.map(a => ({ id: a.modelId, name: a.modelName || a.modelId })),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/v1/responses') {
+    const body = await readBody(req);
+    let payload;
+    try { payload = JSON.parse(body); } catch { sendJson(res, 400, { code: 'invalid_request', message: 'Bad JSON' }); return; }
+
+    const account = getAccounts().find(a => a.modelId === payload.model);
+    if (!account) {
+      sendJson(res, 404, { code: 'invalid_request', message: 'Model not found: ' + payload.model });
+      return;
+    }
+
+    // 健康闸门：已知限额/封号/未登录时直接拒绝，避免白等
+    const health = getAccountHealth()[account.modelId];
+    if (health && health.state && health.state !== 'ok') {
+      const now = Date.now();
+      if (health.state === 'login_required' && health.checkedAt && (now - health.checkedAt) < 30 * 60 * 1000) {
+        sendJson(res, 401, { code: 'authentication_required', message: '账号未登录或登录失效，请重新登录 quick.aws.com 后再试' });
+        return;
+      }
+      if (health.state === 'quota_exceeded' && health.resetAt && health.resetAt > now) {
+        sendJson(res, 429, { code: 'rate_limit_exceeded', message: '账号额度已用完，预计 ' + new Date(health.resetAt).toLocaleString('sv-SE') + ' 恢复' });
+        return;
+      }
+    }
+
+    if (activeModels.has(payload.model)) {
+      sendJson(res, 429, { code: 'rate_limit_exceeded', message: '同一模型只能同时进行一轮对话' });
+      return;
+    }
+
+    // 归一化输入
+    const norm = normalizeInputItems(payload.input);
+    if (norm.unknown.length) console.warn('[input] 未识别的输入项:', norm.unknown.join(', '));
+    const text = norm.items.filter(i => i.kind === 'text').map(i => i.text).join('\n');
+    const files = norm.items.filter(i => i.kind === 'file');
+    if (!text && !files.length) {
+      sendJson(res, 400, { code: 'invalid_request', message: '输入为空：没有可识别的文本/文件项' });
+      return;
+    }
+    if (files.length) {
+      console.warn('[input] 本版本暂不支持文件输入，已忽略 ' + files.length + ' 个文件项');
+    }
+    payload._text = text;
+
+    activeModels.add(payload.model);
+    const release = () => activeModels.delete(payload.model);
+
+    // SSE 头
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+    if (res.socket) res.socket.setNoDelay(true);
+
+    const profile = resolveProfile(account);
+    try {
+      const conn = await getConnection(account, 'quick.aws.com');
+      if (payload.type === 'compress') {
+        await handleCompress({ res, payload, account, conn, cfg: profile.values, profile, release });
+      } else {
+        await handleChat({ res, payload, account, conn, cfg: profile.values, profile, release });
+      }
+    } catch (e) {
+      console.error('[bridge] 处理请求失败:', e.message);
+      release();
+      if (!res.writableEnded) {
+        try {
+          res.write('event: error\n');
+          res.write('data: ' + JSON.stringify({ code: 'internal_error', message: e.message }) + '\n\n');
+          res.end();
+        } catch (_) {}
+      }
+    }
+    return;
+  }
+
+  // ============ 管理 API：账号 ============
+  if (req.method === 'GET' && pathname === '/api/accounts') {
+    const accounts = getAccounts();
+    const healthMap = getAccountHealth();
+    for (const acc of accounts) {
+      acc.status = (await probePort(acc.debugPort)) ? 'online' : 'offline';
+      const eff = resolveProfile(acc);
+      acc.profileId = acc.profileId || 'default';
+      acc.profileName = eff.name;
+      acc.health = healthMap[acc.modelId] || null;
+    }
+    sendJson(res, 200, accounts);
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/accounts') {
+    const body = await readBody(req);
+    let data;
+    try { data = JSON.parse(body); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
+    if (!data.modelId || !data.modelName) { sendJson(res, 400, { error: '缺少 modelId / modelName' }); return; }
+    if (!/^[a-zA-Z0-9_-]+$/.test(data.modelId)) { sendJson(res, 400, { error: 'modelId 仅支持英文、数字、下划线、中划线' }); return; }
+
+    const accounts = getAccounts();
+    if (accounts.find(a => a.modelId === data.modelId)) { sendJson(res, 409, { error: '该 ID 已存在' }); return; }
+
+    let profileId = 'default';
+    if (data.profileId && data.profileId !== 'default') {
+      if (!getProfiles().find(p => p.id === data.profileId)) { sendJson(res, 400, { error: '指定的配置方案不存在' }); return; }
+      profileId = data.profileId;
+    }
+
+    const account = { modelId: data.modelId, modelName: data.modelName, debugPort: allocDebugPort(accounts), profileId, createdAt: Date.now() };
+    accounts.push(account);
+    saveAccounts(accounts);
+    launchChrome(account, resolveProfile(account).values);
+    sendJson(res, 200, { success: true, account });
+    return;
+  }
+
+  if (req.method === 'PUT' && pathname.startsWith('/api/accounts/')) {
+    const modelId = decodeURIComponent(pathname.split('/')[3] || '');
+    const body = await readBody(req);
+    let data;
+    try { data = JSON.parse(body); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
+    const accounts = getAccounts();
+    const acc = accounts.find(a => a.modelId === modelId);
+    if (!acc) { sendJson(res, 404, { error: 'Not found' }); return; }
+    if (data.modelName) acc.modelName = data.modelName;
+    if (data.profileId !== undefined) {
+      if (!data.profileId || data.profileId === 'default') acc.profileId = 'default';
+      else if (!getProfiles().find(p => p.id === data.profileId)) { sendJson(res, 400, { error: '指定的配置方案不存在' }); return; }
+      else acc.profileId = data.profileId;
+    }
+    saveAccounts(accounts);
+    sendJson(res, 200, { success: true });
+    return;
+  }
+
+  if (req.method === 'DELETE' && pathname.startsWith('/api/accounts/')) {
+    const modelId = decodeURIComponent(pathname.split('/')[3] || '');
+    let accounts = getAccounts();
+    if (!accounts.find(a => a.modelId === modelId)) { sendJson(res, 404, { error: 'Not found' }); return; }
+    accounts = accounts.filter(a => a.modelId !== modelId);
+    saveAccounts(accounts);
+    try { await closeConnection(modelId); } catch (_) {}
+    try {
+      const dir = path.join(PROFILES_DIR, modelId);
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 500 });
+    } catch (e) { console.error('[accounts] 删除数据目录失败:', e.message); }
+    sendJson(res, 200, { success: true });
+    return;
+  }
+
+  if (req.method === 'POST' && pathname.startsWith('/api/accounts/') && pathname.endsWith('/open')) {
+    const modelId = decodeURIComponent(pathname.split('/')[3] || '');
+    const account = getAccounts().find(a => a.modelId === modelId);
+    if (!account) { sendJson(res, 404, { error: 'Not found' }); return; }
+    launchChrome(account, resolveProfile(account).values);
+    sendJson(res, 200, { success: true });
+    return;
+  }
+
+  if (req.method === 'GET' && pathname.startsWith('/api/accounts/') && pathname.endsWith('/health')) {
+    const modelId = decodeURIComponent(pathname.split('/')[3] || '');
+    const account = getAccounts().find(a => a.modelId === modelId);
+    if (!account) { sendJson(res, 404, { error: 'Not found' }); return; }
+    try {
+      const cfg = resolveProfile(account).values;
+      const r = await checkAccountHealth(account, cfg);
+      const record = { modelId, ...r, checkedAt: Date.now() };
+      const map = getAccountHealth();
+      map[modelId] = record;
+      saveAccountHealth(map);
+      sendJson(res, 200, record);
+    } catch (e) {
+      sendJson(res, 500, { modelId, state: 'error', message: e.message, checkedAt: Date.now() });
+    }
+    return;
+  }
+
+  // ============ 管理 API：配置方案 ============
+  if (req.method === 'GET' && pathname === '/api/profiles') {
+    sendJson(res, 200, {
+      default: { id: 'default', name: '默认方案', isDefault: true, values: DEFAULT_PROFILE_VALUES },
+      profiles: getProfiles(),
+      labels: FIELD_LABELS,
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/profiles') {
+    const body = await readBody(req);
+    let data;
+    try { data = JSON.parse(body); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
+    const name = String(data.name || '').trim();
+    if (!name) { sendJson(res, 400, { error: '缺少方案名称' }); return; }
+    let values;
+    try { values = data.values ? validateProfile(data.values) : validateProfile({ ...DEFAULT_PROFILE_VALUES }); }
+    catch (e) { sendJson(res, 400, { error: e.message }); return; }
+    const profiles = getProfiles();
+    const created = { id: 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name, values, createdAt: Date.now() };
+    profiles.push(created);
+    saveProfiles(profiles);
+    sendJson(res, 200, created);
+    return;
+  }
+
+  if (req.method === 'PUT' && pathname.startsWith('/api/profiles/')) {
+    const id = decodeURIComponent(pathname.split('/')[3] || '');
+    if (id === 'default') { sendJson(res, 403, { error: '默认方案不可修改' }); return; }
+    const body = await readBody(req);
+    let data;
+    try { data = JSON.parse(body); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
+    const profiles = getProfiles();
+    const p = profiles.find(x => x.id === id);
+    if (!p) { sendJson(res, 404, { error: 'Not found' }); return; }
+    if (data.name !== undefined) {
+      const name = String(data.name || '').trim();
+      if (!name) { sendJson(res, 400, { error: '名称不能为空' }); return; }
+      p.name = name;
+    }
+    if (data.values !== undefined) {
+      try { p.values = validateProfile(data.values); } catch (e) { sendJson(res, 400, { error: e.message }); return; }
+    }
+    saveProfiles(profiles);
+    sendJson(res, 200, p);
+    return;
+  }
+
+  if (req.method === 'DELETE' && pathname.startsWith('/api/profiles/')) {
+    const id = decodeURIComponent(pathname.split('/')[3] || '');
+    if (id === 'default') { sendJson(res, 403, { error: '默认方案不可删除' }); return; }
+    const profiles = getProfiles();
+    if (!profiles.find(x => x.id === id)) { sendJson(res, 404, { error: 'Not found' }); return; }
+    saveProfiles(profiles.filter(x => x.id !== id));
+    const accounts = getAccounts();
+    let affected = 0;
+    for (const acc of accounts) if (acc.profileId === id) { acc.profileId = 'default'; affected++; }
+    if (affected) saveAccounts(accounts);
+    sendJson(res, 200, { success: true, affectedAccounts: affected });
+    return;
+  }
+
+  sendJson(res, 404, { code: 'invalid_request', message: 'Not Found' });
+});
+
+server.listen(HTTP_PORT, '127.0.0.1', () => {
+  console.log('[Cuko Provider] 运行在 http://127.0.0.1:' + HTTP_PORT);
+  console.log('[Cuko Provider] 管理台: http://127.0.0.1:' + HTTP_PORT + '/');
+  const chrome = resolveChromePath(DEFAULT_PROFILE_VALUES);
+  if (!chrome) console.warn('[Cuko Provider] 未探测到 Chrome，请在配置方案里指定 chromePath');
+});
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, async () => {
+    console.log('\n[bridge] 收到 ' + sig + '，正在关闭…');
+    try { await closeAllConnections(); } catch (_) {}
+    process.exit(0);
+  });
+}

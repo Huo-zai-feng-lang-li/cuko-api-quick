@@ -1,0 +1,168 @@
+/**
+ * Quick 网页版页面交互（选择器与操作都基于 2026-11-23 实测的真实 DOM）
+ *
+ * 实测结构（登录后，quick.aws.com/sn/account/<id>/start/chat）：
+ *   输入框   textarea，placeholder「提问或键入 @ 以提醒代理...」，无 id/class
+ *            祖先：div.mention-highlight-wrapper > div.input-card-body > div.input-card
+ *                  > div.home-input-anchor（对话页里换成消息区锚点）
+ *   发送按钮 button[aria-label="发送消息"]，空内容时 disabled
+ *   停止按钮 生成中出现（aria-label 含"停止"）
+ *   新对话   button，文本「新对话」
+ *   模式     按钮 title「智能 模式」（fast/balanced/smart/advanced）
+ *
+ * 注意：类名多为构建产物的普通类名（input-card 等），仍可能随发版变化，
+ * 因此所有选择器都按「语义属性优先、结构类名兜底」排序。
+ */
+
+/** 输入框候选（按可靠性排序） */
+export const COMPOSER_CANDIDATES = [
+  'textarea[placeholder*="提问"]',
+  'textarea[placeholder*="ask" i]',
+  'textarea[placeholder*="键入"]',
+  'textarea',
+  'div[contenteditable="true"][role="textbox"]',
+  'div[contenteditable="true"]',
+];
+
+/** 发送按钮候选 */
+export const SEND_BUTTON_CANDIDATES = [
+  'button[aria-label="发送消息"]',
+  'button[aria-label*="发送"]',
+  'button[aria-label*="Send" i]',
+  'button[data-testid*="send" i]',
+];
+
+/** 停止生成按钮候选 */
+export const STOP_BUTTON_CANDIDATES = [
+  'button[aria-label*="停止"]',
+  'button[aria-label*="Stop" i]',
+];
+
+/** 新对话按钮 */
+export const NEW_CHAT_EXPR = `(() => {
+  const labels = ['新对话', 'new chat', '新建对话', 'new conversation'];
+  const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+  for (const el of nodes) {
+    if (el.offsetParent === null) continue;
+    const text = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+    if (labels.some(l => text.includes(l.toLowerCase()))) {
+      el.click();
+      return { ok: true, how: 'clicked' };
+    }
+  }
+  return { ok: false };
+})()`;
+
+/** 公共前置：可见性判断 */
+const VISIBLE_FN = `const visible = (el) => {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  if (r.width < 8 || r.height < 8) return false;
+  const s = getComputedStyle(el);
+  return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+};`;
+
+/** 读输入区状态 */
+export const READ_COMPOSER_EXPR = `(() => {
+  ${VISIBLE_FN}
+  const sels = ${JSON.stringify(COMPOSER_CANDIDATES)};
+  let el = null, usedSel = null;
+  for (const s of sels) {
+    const nodes = Array.from(document.querySelectorAll(s)).filter(n => visible(n) && !n.disabled && !n.readOnly);
+    if (nodes.length) { el = nodes[nodes.length - 1]; usedSel = s; break; }
+  }
+  if (!el) return { ok: false, value: '', focused: false, tag: null, sel: null };
+  const editable = el.isContentEditable === true;
+  const value = editable ? String(el.innerText || el.textContent || '') : String(el.value == null ? '' : el.value);
+  const active = document.activeElement;
+  return {
+    ok: true, value, sel: usedSel, tag: el.tagName, editable,
+    focused: active === el || (active && el.contains && el.contains(active)),
+    disabled: !!el.disabled, readOnly: !!el.readOnly,
+  };
+})()`;
+
+/** 聚焦输入框并把光标放到末尾 */
+export const FOCUS_COMPOSER_EXPR = `(() => {
+  ${VISIBLE_FN}
+  const sels = ${JSON.stringify(COMPOSER_CANDIDATES)};
+  for (const s of sels) {
+    const nodes = Array.from(document.querySelectorAll(s)).filter(n => visible(n));
+    if (!nodes.length) continue;
+    const el = nodes[nodes.length - 1];
+    el.focus();
+    try {
+      if (el.isContentEditable) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } else if (typeof el.setSelectionRange === 'function') {
+        el.setSelectionRange(el.value.length, el.value.length);
+      }
+    } catch (e) {}
+    return { ok: true, sel: s, tag: el.tagName };
+  }
+  return { ok: false };
+})()`;
+
+/** 是否仍在生成 */
+export const IS_GENERATING_EXPR = `(() => {
+  ${VISIBLE_FN}
+  const sels = ${JSON.stringify(STOP_BUTTON_CANDIDATES)};
+  for (const s of sels) {
+    try {
+      const nodes = Array.from(document.querySelectorAll(s));
+      if (nodes.some(n => visible(n))) return true;
+    } catch (e) {}
+  }
+  return false;
+})()`;
+
+/** 发送按钮状态（用于「内容已就绪」判定与回车失败时兜底点击） */
+export const SEND_BUTTON_STATE_EXPR = `(() => {
+  ${VISIBLE_FN}
+  const sels = ${JSON.stringify(SEND_BUTTON_CANDIDATES)};
+  for (const s of sels) {
+    const nodes = Array.from(document.querySelectorAll(s)).filter(n => visible(n));
+    if (nodes.length) {
+      const b = nodes[nodes.length - 1];
+      const r = b.getBoundingClientRect();
+      return { found: true, disabled: !!b.disabled, sel: s,
+        x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    }
+  }
+  return { found: false };
+})()`;
+
+/** 输入区快照（排障用） */
+export const DUMP_STATE_EXPR = `(() => {
+  ${VISIBLE_FN}
+  const clip = (s, n) => String(s == null ? '' : s).slice(0, n);
+  const info = (el) => {
+    const r = el.getBoundingClientRect();
+    return { tag: el.tagName, cls: clip(typeof el.className === 'string' ? el.className : '', 40),
+      ph: clip(el.placeholder, 24), aria: el.getAttribute('aria-label'),
+      w: Math.round(r.width), h: Math.round(r.height), vis: visible(el) };
+  };
+  return {
+    url: location.href,
+    editables: Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).slice(0, 6).map(info),
+    sendButtons: Array.from(document.querySelectorAll('button[aria-label*="发送"],button[aria-label*="Send"]')).slice(0, 4)
+      .map(b => ({ aria: b.getAttribute('aria-label'), disabled: !!b.disabled, vis: visible(b) })),
+    active: document.activeElement ? document.activeElement.tagName : null,
+  };
+})()`;
+
+/**
+ * 从页面 URL 提取会话 ID。
+ * Quick 的对话 id 形如 3e079448-101e-4a95-a95b-a3a942443ba8，出现在路径或查询里。
+ * @param {string} url
+ * @returns {string|null}
+ */
+export function extractThreadIdFromUrl(url) {
+  const m = String(url || '').match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  return m ? m[0] : null;
+}
