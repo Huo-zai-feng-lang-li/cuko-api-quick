@@ -16,10 +16,23 @@
  *  - 任一失败则重建连接（ensureAlive）
  */
 import CDP from 'chrome-remote-interface';
+import { commandLineMatchesProfile } from './profile-check.js';
+import { verifyChromeProfile } from './chrome.js';
 
 const connections = new Map(); // modelId -> CdpConnection
 
-class CdpConnection {
+/**
+ * CDP Network 缓冲上限。
+ * 本项目只消费 WebSocket 帧，不读响应体；原来的 100MB/50MB 纯属浪费，
+ * 账号多时会被 Chrome 按目标页预留，直接放大内存占用。
+ */
+const NETWORK_BUFFER = Object.freeze({
+  maxTotalBufferSize: 20 * 1024 * 1024,
+  maxResourceBufferSize: 10 * 1024 * 1024,
+  maxPostDataSize: 20 * 1024 * 1024,
+});
+
+export class CdpConnection {
   constructor(account, targetMatch) {
     this.account = account;
     // 目标页面匹配：URL 里包含该片段即为聊天页
@@ -45,21 +58,30 @@ class CdpConnection {
         throw new Error('找不到目标页面 target（' + this.targetMatch + '）');
       }
       this.client = await CDP({ target: target.webSocketDebuggerUrl });
-      this.Runtime = this.client.Runtime;
-      this.Input = this.client.Input;
-      this.Network = this.client.Network;
-      this.Page = this.client.Page;
-      this.DOM = this.client.DOM;
+      try {
+        this.Runtime = this.client.Runtime;
+        this.Input = this.client.Input;
+        this.Network = this.client.Network;
+        this.Page = this.client.Page;
+        this.DOM = this.client.DOM;
 
-      await this.Page.enable();
-      await this.Runtime.enable();
-      // [261123-attach] 附件注入依赖 DOM 域
-      await this.DOM.enable();
-      await this.Network.enable({
-        maxTotalBufferSize: 104857600,
-        maxResourceBufferSize: 52428800,
-        maxPostDataSize: 104857600,
-      });
+        await this.Page.enable();
+        await this.Runtime.enable();
+        // [261123-attach] 附件注入依赖 DOM 域
+        await this.DOM.enable();
+        await this.Network.enable(NETWORK_BUFFER);
+
+        // 端口只能证明“有人在监听”，不能证明“监听的是这个账号”。
+        // 删除账号后旧 Chrome 可能还占着端口，这里用启动参数做归属校验，
+        // 不匹配就拒绝连接，避免请求发到别的 Quick 登录态上。
+        await this._verifyProfile();
+      } catch (e) {
+        // enable() / _verifyProfile() 任一阶段失败都要对称释放 client，避免 WebSocket 泄漏。
+        try { if (this.client) this.client.close(); } catch (_) {}
+        this.client = null;
+        this.alive = false;
+        throw e;
+      }
 
       this.client.on('disconnect', () => {
         this.alive = false;
@@ -103,6 +125,55 @@ class CdpConnection {
       this.client = null;
       await this.connect();
     }
+  }
+
+  /**
+   * 校验端口上的 Chrome 是不是这个账号启动的。
+   *
+   * 用 Browser 级 SystemInfo.getInfo().commandLine 里的 --user-data-dir 比对。
+   * 拿不到命令行时只告警放行（兼容旧版 Chrome / 权限受限），
+   * 拿得到且不匹配则直接拒绝，防止端口复用时串号。
+   */
+  async _verifyProfile() {
+    const si = this.client && this.client.SystemInfo;
+    if (!si || typeof si.getInfo !== 'function') {
+      console.warn('[CDP-conn] SystemInfo 域不可用，改用进程命令行校验:', this.account.modelId);
+      await this._verifyProfileByPort();
+      return;
+    }
+    let cmd = '';
+    try {
+      const info = await si.getInfo();
+      cmd = String((info && info.commandLine) || '');
+    } catch (e) {
+      console.warn('[CDP-conn] 读取 Chrome 启动参数失败，改用进程命令行校验:', e.message);
+      await this._verifyProfileByPort();
+      return;
+    }
+    if (!cmd) {
+      console.warn('[CDP-conn] Chrome 未返回启动参数，改用进程命令行校验:', this.account.modelId);
+      await this._verifyProfileByPort();
+      return;
+    }
+    if (!commandLineMatchesProfile(cmd, this.account.modelId)) {
+      throw new Error(
+        '调试端口 ' + this.account.debugPort + ' 上的 Chrome 不是账号 ' +
+        this.account.modelId + ' 的实例（user-data-dir 不匹配）',
+      );
+    }
+  }
+
+  /**
+   * SystemInfo 拿不到时的兜底：按端口找 PID，再读进程命令行。
+   * 明确不匹配 → 拒绝；读不到 → 只告警放行，避免权限受限时服务不可用。
+   */
+  async _verifyProfileByPort() {
+    const r = await verifyChromeProfile(this.account.debugPort, this.account.modelId);
+    if (r.ok) return;
+    if (r.reason === 'mismatch') {
+      throw new Error(r.error + '（user-data-dir 不匹配）');
+    }
+    console.warn('[CDP-conn] 无法校验端口归属，跳过:', r.error);
   }
 
   /**

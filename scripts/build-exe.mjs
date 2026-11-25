@@ -125,7 +125,7 @@ fs.writeFileSync(path.join(DIST_DIR, '使用说明.txt'), [
   '【怎么用】',
   '  1. 双击 cuko-api-quick.exe 启动（会弹出一个命令行窗口，别关它）',
   '  2. 浏览器打开 http://127.0.0.1:3000/ 进入管理台',
-  '  3. 填模型 ID（如 quick-main）+ 显示名称，点「添加并启动 Chrome」',
+  '  3. 填模型 ID（如 aws），点「添加并启动 Chrome」',
   '  4. 在弹出的 Chrome 窗口里登录 quick.aws.com',
   '  5. 回管理台点「检查」，看到 ok 就可以用了',
   '  6. 在支持 Cuko API 的客户端里填中转地址 http://127.0.0.1:3000/，Token 留空',

@@ -8,6 +8,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import {
   esDrain, decodeOuterPayload, decodeEventStreamMessage, decodeUplinkFrame,
   encodeUplinkFrame, extractInnerEvents, QuickTurnExtractor,
@@ -16,6 +17,11 @@ import { parseQuickUrl, buildConversationUrl, isOnConversation, extractThreadIdF
 import { DEFAULT_PROFILE_VALUES, validateProfile } from '../bridge/default-config.js';
 import { DEFAULT_RUNTIME_CONFIG } from '../bridge/runtime-config.js';
 import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD, safeFileName, cleanupAttachments } from '../bridge/attachments.js';
+import { commandLineMatchesProfile } from '../bridge/profile-check.js';
+import { CdpConnection } from '../bridge/cdp-connection.js';
+import { QuickChannel } from '../bridge/quick-transport.js';
+import { isPortFree } from '../bridge/chrome.js';
+import { createSerialLock } from '../bridge/serial-lock.js';
 
 const test = (name, fn) => globalThis.__test(name, fn);
 const assert = globalThis.__assert;
@@ -57,7 +63,7 @@ test('完整一轮：正文 / 用量 / 结束 / threadId', () => {
   assert.equal(ex.finished, true);
   assert.equal(ex.error, null);
   assert.equal(ex.usage.total_tokens, 70310);
-  assert.equal(ex.threadId, '3e079448-101e-4a95-a95b-a3a942443ba8');
+  assert.equal(ex.threadId, '00000000-0000-4000-8000-000000000004');
 });
 
 test('分片重组：按 7 字节切片结果一致且无残留', () => {
@@ -121,9 +127,9 @@ test('状态机：text_complete 全文兜底', () => {
 });
 
 // ============ 会话 URL 解析（续接依赖它，回归重点） ============
-const CA = '090212b4-1268-44cf-843e-2e7f6faa9857';
-const CB = '6484c36d-7e7c-431d-b410-57456fb59201';
-const ACCT = '261414899405';
+const CA = '00000000-0000-4000-8000-000000000001';
+const CB = '00000000-0000-4000-8000-000000000002';
+const ACCT = '123456789012';
 const chatUrl = (cid) => 'https://quick.aws.com/sn/account/' + ACCT + '/start/chat' + (cid ? '?conversationId=' + cid : '');
 
 test('URL 解析：带会话', () => {
@@ -168,7 +174,7 @@ test('默认 targetUrl 用 /sn/start，不是落地页 /sn', () => {
 });
 
 test('buildChatUrl：有账号 ID 时直达聊天页', () => {
-  assert.equal(buildChatUrl('261414899405'), 'https://quick.aws.com/sn/account/261414899405/start/chat');
+  assert.equal(buildChatUrl('123456789012'), 'https://quick.aws.com/sn/account/123456789012/start/chat');
 });
 
 test('buildChatUrl：没有账号 ID 时兜底到 /sn/start（绝不能是 /sn）', () => {
@@ -179,7 +185,7 @@ test('buildChatUrl：没有账号 ID 时兜底到 /sn/start（绝不能是 /sn�
 
 test('/sn/start 本身解析不出账号，跳转后才有', () => {
   assert.equal(parseQuickUrl('https://quick.aws.com/sn/start').accountId, null);
-  assert.equal(parseQuickUrl('https://quick.aws.com/sn/account/261414899405/start/chat').accountId, '261414899405');
+  assert.equal(parseQuickUrl('https://quick.aws.com/sn/account/123456789012/start/chat').accountId, '123456789012');
 });
 
 // ============ 超长文本转附件 ============
@@ -281,4 +287,82 @@ test('openInBrowser 是函数且空 URL 直接返回 false', async () => {
   const { openInBrowser } = await import('../bridge/open-browser.js');
   assert.equal(typeof openInBrowser, 'function');
   assert.equal(await openInBrowser(''), false);
+});
+
+// ============ Chrome profile 归属校验 ============
+const PROFILES_ROOT = path.join('C:\\', 'Cuko', 'data', 'profiles');
+
+test('profile 校验：Windows 引号路径能匹配', () => {
+  const cmd = 'chrome.exe --user-data-dir="' + path.join(PROFILES_ROOT, 'aws') + '" --remote-debugging-port=9222';
+  assert.equal(commandLineMatchesProfile(cmd, 'aws', PROFILES_ROOT), true);
+});
+
+test('profile 校验：aws 不会误匹配 aws2 / aws-2', () => {
+  const aws2 = 'chrome.exe --user-data-dir="' + path.join(PROFILES_ROOT, 'aws2') + '" --remote-debugging-port=9223';
+  const awsDash = 'chrome.exe --user-data-dir="' + path.join(PROFILES_ROOT, 'aws-2') + '" --remote-debugging-port=9224';
+  assert.equal(commandLineMatchesProfile(aws2, 'aws', PROFILES_ROOT), false);
+  assert.equal(commandLineMatchesProfile(awsDash, 'aws', PROFILES_ROOT), false);
+});
+
+test('profile 校验：正斜杠、无引号也能匹配', () => {
+  const cmd = 'chrome.exe --user-data-dir=C:/Cuko/data/profiles/aws --headless';
+  assert.equal(commandLineMatchesProfile(cmd, 'aws', PROFILES_ROOT), true);
+});
+
+test('profile 校验：尾部斜杠也能匹配', () => {
+  const cmd = 'chrome.exe --user-data-dir="C:\\Cuko\\data\\profiles\\aws\\" --flag';
+  assert.equal(commandLineMatchesProfile(cmd, 'aws', PROFILES_ROOT), true);
+});
+
+test('profile 校验：缺少 user-data-dir 时拒绝', () => {
+  assert.equal(commandLineMatchesProfile('chrome.exe --remote-debugging-port=9222', 'aws', PROFILES_ROOT), false);
+});
+
+// ============ 端口分配与并发写保护 ============
+test('端口检查：被 TCP 服务占用时返回 false，释放后返回 true', async () => {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const port = server.address().port;
+  assert.equal(await isPortFree(port), false);
+  await new Promise((resolve) => server.close(resolve));
+  assert.equal(await isPortFree(port), true);
+});
+
+test('串行锁：任务按入队顺序执行，前一个失败不阻塞后续', async () => {
+  const lock = createSerialLock();
+  const order = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const first = lock(async () => {
+    order.push('a-start');
+    await gate;
+    order.push('a-end');
+  });
+  const second = lock(async () => { order.push('b'); });
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ['a-start', 'a-end', 'b']);
+
+  let failure = null;
+  const failed = lock(async () => { throw new Error('boom'); }).catch((e) => { failure = e; });
+  const after = lock(async () => { order.push('c'); });
+  await failed;
+  await after;
+  assert.equal(failure.message, 'boom');
+  assert.equal(order[order.length - 1], 'c');
+});
+
+// ============ CDP 作用域回收 ============
+test('QuickChannel.close 会把作用域从连接里摘掉', () => {
+  const conn = new CdpConnection({ modelId: '__scope_test__', debugPort: 9999 });
+  const channel = new QuickChannel(conn.createScope());
+  assert.equal(conn.scopes.size, 1);
+  channel.close();
+  assert.equal(conn.scopes.size, 0, 'close 后不能留下作用域，否则每轮对话都会泄漏');
+  assert.equal(channel.closed, true);
+  channel.close(); // 幂等
+  assert.equal(conn.scopes.size, 0);
 });

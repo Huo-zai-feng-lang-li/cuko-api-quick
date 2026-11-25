@@ -121,6 +121,19 @@ export const IS_GENERATING_EXPR = `(() => {
   return false;
 })()`;
 
+/** 点掉“停止生成”按钮；找不到说明回合已结束 */
+export const STOP_GENERATION_EXPR = `(() => {
+  ${VISIBLE_FN}
+  const sels = ${JSON.stringify(STOP_BUTTON_CANDIDATES)};
+  for (const s of sels) {
+    try {
+      const nodes = Array.from(document.querySelectorAll(s)).filter(n => visible(n));
+      if (nodes.length) { nodes[nodes.length - 1].click(); return { ok: true, how: s }; }
+    } catch (e) {}
+  }
+  return { ok: false };
+})()`;
+
 /** 发送按钮状态（用于「内容已就绪」判定与回车失败时兜底点击） */
 export const SEND_BUTTON_STATE_EXPR = `(() => {
   ${VISIBLE_FN}
@@ -212,7 +225,7 @@ export function isOnConversation(currentUrl, wantConversationId) {
  * 从页面读出 AWS 账号 ID（用于拼聊天页 URL）。
  *
  * 实测（2026-11-23）有三条可靠来源，按优先级取：
- *   1. cookie `qs-directory-alias`       —— 最直接，形如 "261414899405"
+ *   1. cookie `qs-directory-alias`       —— 最直接，形如 "123456789012"
  *   2. cookie `aws-directoryUserInfo`    —— JSON，里面有 alias 字段
  *   3. localStorage `quickwork-web-last-user` —— ARN，形如
  *      arn:aws:quicksight::<accountId>:user-internal/...

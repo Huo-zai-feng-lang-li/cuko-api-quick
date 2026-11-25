@@ -9,13 +9,44 @@
  *    按钮点不动再回退 CDP 物理回车。
  *  - 发送成功的判据：输入框被清空，或页面进入生成中（出现停止按钮）。
  */
-import { randomInRange } from './default-config.js';
 import {
-  READ_COMPOSER_EXPR, FOCUS_COMPOSER_EXPR, IS_GENERATING_EXPR,
+  DEFAULT_PROFILE_VALUES, pollDelayMs, composerTextMatches, decideSendReady,
+  pasteVerifyWindowMs,
+} from './default-config.js';
+import {
+  READ_COMPOSER_EXPR, FOCUS_COMPOSER_EXPR, IS_GENERATING_EXPR, STOP_GENERATION_EXPR,
   SEND_BUTTON_STATE_EXPR, DUMP_STATE_EXPR, NEW_CHAT_EXPR,
   parseQuickUrl, buildConversationUrl, isOnConversation,
   detectAccountId, buildChatUrl,
 } from './page.js';
+
+/**
+ * 从 cfg 解析自适应等待参数（毫秒/秒混合）。
+ * 配置缺字段时回落到内置默认值；调用方传部分 cfg 也不会炸。
+ * @param {object} [cfg] 配置方案 values
+ * @returns {{fastMs:number, slowMs:number, rampAfter:number, pasteVerifyBaseSec:number,
+ *   pasteVerifyCapSec:number, preEnterMinMs:number, composerRetryDelayMs:number, attachSyncDelayMs:number}}
+ */
+function timingOpts(cfg) {
+  const d = DEFAULT_PROFILE_VALUES;
+  const num = (k, fb) => {
+    const n = Number(cfg && cfg[k]);
+    return Number.isFinite(n) && n >= 0 ? n : fb;
+  };
+  return {
+    fastMs: Math.round(num('pollFastSec', d.pollFastSec) * 1000),
+    slowMs: Math.round(num('pollSlowSec', d.pollSlowSec) * 1000),
+    rampAfter: Math.max(1, Math.floor(num('pollRampAfterAttempts', d.pollRampAfterAttempts))),
+    pasteVerifyBaseSec: num('pasteVerifyMaxSec', d.pasteVerifyMaxSec),
+    pasteVerifyCapSec: num('pasteVerifyCapSec', d.pasteVerifyCapSec),
+    preEnterMinMs: Math.round(num('preEnterMinSec', d.preEnterMinSec) * 1000),
+    composerRetryDelayMs: Math.round(num('composerRetryDelaySec', d.composerRetryDelaySec) * 1000),
+    attachSyncDelayMs: Math.round(num('attachSyncDelaySec', d.attachSyncDelaySec) * 1000),
+  };
+}
+
+/** 可注入的 sleep（测试可替换） */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 读输入区状态 */
 export async function readComposer(conn) {
@@ -45,6 +76,20 @@ export async function isGenerating(conn) {
   } catch (_) { return false; }
 }
 
+/**
+ * 点掉 Quick 页面的“停止生成”按钮。
+ * 独立于 HTTP close 链路，供显式停止入口直接调用；找不到按钮说明本轮回合已结束。
+ * @param {object} conn CDP 常驻连接
+ * @returns {Promise<{ok:boolean, how?:string}>}
+ */
+export async function stopQuickGeneration(conn) {
+  if (!conn) return { ok: false };
+  try {
+    const r = await conn.Runtime.evaluate({ expression: STOP_GENERATION_EXPR, returnByValue: true });
+    return (r && r.result && r.result.value) || { ok: false };
+  } catch (_) { return { ok: false }; }
+}
+
 /** 发送按钮状态 */
 export async function sendButtonState(conn) {
   try {
@@ -71,14 +116,21 @@ export async function currentUrl(conn) {
   } catch (_) { return ''; }
 }
 
-/** 轮询等待输入区出现 */
-export async function waitForComposer(conn, maxSec) {
-  // [261123-continue-fix] 导航后前 1~2 秒，页面处于 loading 中间态：
-  // Runtime.evaluate 可能抛「Cannot find context」或返回空，
-  // 旧实现只按 1s 一次粗轮询，容易在过渡期耗掉预算后误判失败。
-  // 改为 250ms 细轮询，并对异常/空结果继续重试，而不是直接当作未就绪。
+/**
+ * 轮询等待输入区出现。
+ * [261123-continue-fix] 导航后前 1~2 秒页面处于 loading 中间态，
+ * 对异常/空结果继续重试，不直接判未就绪。
+ * [261123-timing] 轮询间隔渐进退避：前几次快速探，连续未就绪再放缓，命中即退出。
+ * @param {object} conn CDP 常驻连接
+ * @param {number} maxSec 最长等待秒数
+ * @param {object} [cfg] 配置方案 values（可选，缺省用内置默认）
+ * @returns {Promise<object|null>} 输入区状态；超时返回 null
+ */
+export async function waitForComposer(conn, maxSec, cfg) {
+  const t = timingOpts(cfg);
   const deadline = Date.now() + Math.max(1, maxSec) * 1000;
   let lastErr = null;
+  let attempt = 0;
   while (Date.now() < deadline) {
     try {
       const r = await conn.Runtime.evaluate({ expression: READ_COMPOSER_EXPR, returnByValue: true });
@@ -88,7 +140,7 @@ export async function waitForComposer(conn, maxSec) {
       // 导航过渡期上下文重建，属预期，继续等
       lastErr = e.message;
     }
-    await new Promise(r => setTimeout(r, 250));
+    await sleep(pollDelayMs(attempt++, t));
   }
   if (lastErr) console.warn('[Send] waitForComposer 超时，最后一次错误:', lastErr);
   return null;
@@ -168,18 +220,48 @@ async function clickSendButton(conn) {
   return String((r && r.result && r.result.value) || 'error');
 }
 
-/** 判定「真的发出去了」 */
-async function waitSent(conn, hadText, timeoutMs) {
+/**
+ * 判定「真的发出去了」。
+ * [261123-timing] 轮询间隔渐进退避，命中（进入生成中 / 输入框清空）立即返回。
+ * @param {object} conn CDP 常驻连接
+ * @param {boolean} hadText 发送前输入框是否有文本
+ * @param {number} timeoutMs 等待窗口毫秒
+ * @param {object} [cfg] 配置方案 values
+ * @returns {Promise<{ok:boolean, how?:string}>}
+ */
+async function waitSent(conn, hadText, timeoutMs, cfg) {
+  const t = timingOpts(cfg);
   const t0 = Date.now();
+  let attempt = 0;
   while (Date.now() - t0 < timeoutMs) {
     if (await isGenerating(conn)) return { ok: true, how: '页面进入生成中' };
     if (hadText) {
       const st = await readComposer(conn);
       if (!String(st.value || '').trim()) return { ok: true, how: '输入框已清空' };
     }
-    await new Promise(r => setTimeout(r, 150));
+    await sleep(pollDelayMs(attempt++, t));
   }
   return { ok: false };
+}
+
+/**
+ * 填词后核对输入框内容与预期一致；命中即退出，未命中只等到自适应窗口上限。
+ * 窗口随文本长度放大（短文本用基准下限，长文本封顶），避免长 prompt 渲染慢被误判。
+ * 不命中不直接判失败：后续按钮就绪检查与填词重试保底路径仍然保留。
+ * @param {object} conn CDP 常驻连接
+ * @param {string} expected 预期文本
+ * @param {ReturnType<typeof timingOpts>} t 解析后的等待参数
+ * @returns {Promise<void>}
+ */
+async function verifyComposerText(conn, expected, t) {
+  const maxMs = pasteVerifyWindowMs(expected, t.pasteVerifyBaseSec, t.pasteVerifyCapSec);
+  const deadline = Date.now() + maxMs;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    const st = await readComposer(conn);
+    if (composerTextMatches(st.value, expected)) return;
+    await sleep(pollDelayMs(attempt++, t));
+  }
 }
 
 /**
@@ -189,17 +271,19 @@ async function waitSent(conn, hadText, timeoutMs) {
  * @param {object} cfg 配置方案 values
  * @param {object} [opts]
  * @param {boolean} [opts.skipPreEnterWait]
+ * @param {boolean} [opts.hasAttachments]
  * @returns {Promise<{ok:boolean, error?:string, how?:string}>}
  */
 export async function sendUserMessage(conn, text, cfg, opts = {}) {
   if (!text || !String(text).trim()) return { ok: false, error: '没有可发送的文本' };
+  const t = timingOpts(cfg);
 
   // 1. 填入输入框
   await focusComposer(conn);
   let filled = await fillComposer(conn, text);
   if (!filled.ok) {
     console.warn('[Send] 首次填词失败，重试一次:', JSON.stringify(filled));
-    await new Promise(r => setTimeout(r, 800));
+    await sleep(t.composerRetryDelayMs);
     await focusComposer(conn);
     filled = await fillComposer(conn, text);
   }
@@ -209,19 +293,23 @@ export async function sendUserMessage(conn, text, cfg, opts = {}) {
   }
   console.log('[Send] 已填入输入框，长度 ' + filled.wrote);
 
-  // 2. 等发送按钮可用（React 完成状态更新）
+  // 1b. 自适应核对输入框内容：与预期一致立即退出，否则只等到按长度放大的窗口上限
+  await verifyComposerText(conn, text, t);
+
+  // 2. 等发送按钮可用（React 完成状态更新）；渐进退避轮询，可用即退出
   let btn = { found: false };
-  for (let i = 0; i < 20; i++) {
+  const btnDeadline = Date.now() + 3000;
+  let attempt = 0;
+  while (Date.now() < btnDeadline) {
     btn = await sendButtonState(conn);
-    if (btn.found && !btn.disabled) break;
-    await new Promise(r => setTimeout(r, 150));
+    if (decideSendReady(btn).ready) break;
+    await sleep(pollDelayMs(attempt++, t));
   }
   if (!btn.found) console.warn('[Send] 没找到发送按钮，将回退回车');
 
-  // 3. 回车前随机等待（模拟真人节奏）
+  // 3. 回车前保底等待：只给 React 一次状态更新机会，不再默认随机长等
   if (!opts.skipPreEnterWait) {
-    const waitMs = randomInRange(cfg.preEnterWaitMinSec, cfg.preEnterWaitMaxSec);
-    await new Promise(r => setTimeout(r, waitMs));
+    await sleep(t.preEnterMinMs);
   }
 
   const st = await readComposer(conn);
@@ -243,14 +331,14 @@ export async function sendUserMessage(conn, text, cfg, opts = {}) {
   let how = 'click';
   let clicked = await clickSendButton(conn);
   console.log('[Send] 点击发送按钮 -> ' + clicked);
-  let sent = await waitSent(conn, hadText, firstWait);
+  let sent = await waitSent(conn, hadText, firstWait, cfg);
 
   if (!sent.ok) {
     console.warn('[Send] 点击后未确认发送，回退 CDP 回车');
     how = 'enter';
     await focusComposer(conn);
     await pressEnter(conn);
-    sent = await waitSent(conn, hadText, retryWait);
+    sent = await waitSent(conn, hadText, retryWait, cfg);
   }
 
   if (sent.ok) {
@@ -267,7 +355,14 @@ export async function sendUserMessage(conn, text, cfg, opts = {}) {
   return { ok: true, how, note: 'unconfirmed' };
 }
 
-/** 回到「新对话」 */
+/**
+ * 回到「新对话」。
+ * [261123-timing] 点完新对话按钮后不再固定 sleep 1200ms，
+ * 直接轮询输入区出现即返回（上限 10s），页面快就早返回。
+ * @param {object} conn CDP 常驻连接
+ * @param {object} [cfg] 配置方案 values
+ * @returns {Promise<boolean>}
+ */
 export async function startNewChat(conn, cfg) {
   // 1) 首选：点页面自己的「新对话」按钮（最贴近真实用户操作）
   try {
@@ -275,9 +370,8 @@ export async function startNewChat(conn, cfg) {
     const v = (r && r.result && r.result.value) || {};
     if (v.ok) {
       console.log('[Send] 已点击新对话按钮');
-      await new Promise(res => setTimeout(res, 1200));
       // 点完之后必须确认真的到了聊天页，否则继续走兜底
-      const st = await waitForComposer(conn, 10);
+      const st = await waitForComposer(conn, 10, cfg);
       if (st) return true;
       console.warn('[Send] 点了新对话但输入区没出来，改用 URL 兜底');
     }
@@ -294,7 +388,7 @@ export async function startNewChat(conn, cfg) {
       const url = buildChatUrl(accountId);
       console.log('[Send] 导航到聊天页:', url);
       await conn.Page.navigate({ url });
-      const st = await waitForComposer(conn, Math.max(15, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25)));
+      const st = await waitForComposer(conn, Math.max(15, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25)), cfg);
       if (st) return true;
       console.warn('[Send] 直达聊天页后输入区未就绪，改用 /sn/start 兜底');
     }
@@ -307,7 +401,7 @@ export async function startNewChat(conn, cfg) {
     const fallback = 'https://quick.aws.com/sn/start';
     console.log('[Send] 导航到入口页:', fallback);
     await conn.Page.navigate({ url: fallback });
-    const st = await waitForComposer(conn, Math.max(20, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25)));
+    const st = await waitForComposer(conn, Math.max(20, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25)), cfg);
     if (st) return true;
     console.warn('[Send] 入口页导航后输入区仍未就绪');
     return false;
@@ -349,22 +443,24 @@ export async function gotoConversation(conn, conversationId, cfg) {
   }
 
   // 等 URL 里的 conversationId 变成目标值；最多等 pageReadyPollMaxSec 秒
+  const t = timingOpts(cfg);
   const maxSec = Math.max(5, Math.ceil((cfg && cfg.pageReadyPollMaxSec) || 25));
   const deadline = Date.now() + maxSec * 1000;
   let urlNow = '';
+  let attempt = 0;
   while (Date.now() < deadline) {
     urlNow = await currentUrl(conn);
     if (isOnConversation(urlNow, conversationId)) {
       // URL 切对之后，页面还要重新渲染一次（实测约 2~4s），
       // 这里单独给一段充裕的时间等输入区，而不是沿用上面循环的剩余时间。
-      const st = await waitForComposer(conn, Math.max(15, maxSec));
+      const st = await waitForComposer(conn, Math.max(15, maxSec), cfg);
       if (st) {
         console.log('[Send] 已进入会话并就绪:', urlNow);
         return { ok: true, url: urlNow, navigated: true };
       }
       return { ok: false, error: '会话 URL 已切换但输入区未就绪（已等待 ' + Math.max(15, maxSec) + 's）: ' + urlNow };
     }
-    await new Promise(r => setTimeout(r, 400));
+    await sleep(pollDelayMs(attempt++, t));
   }
   return { ok: false, error: '导航超时：' + maxSec + 's 内 URL 未切到目标会话（当前: ' + urlNow + '，目标: ' + conversationId + '）' };
 }
@@ -403,19 +499,43 @@ export async function attachFiles(conn, filePaths, cfg) {
   }
   if (!nodeId) return { ok: false, error: '页面上找不到 input[type=file]（Quick 可能改版了）' };
 
-  // 2. 记录上传请求完成情况，用来确认真的传完了
-  const uploadUrls = new Set();
+  // 2. 记录上传请求完成情况，用来确认真的传完了。
+  // 注意：requestWillBeSent 的 requestId 不含 URL，必须单独存 URL 映射；
+  // 之前用 requestId 去匹配 /upload/ 永远不命中，图片又没有文件名文本，
+  // 结果上传早就完成却一直等到 60s 超时。
+  const uploadUrls = new Map();
   const done = new Set();
   let scope = null;
   try {
     scope = conn.createScope();
     scope.Network.requestWillBeSent((p) => {
       const u = (p.request && p.request.url) || '';
-      if (/invocations\/files\/upload|attachments\/presigned-url/i.test(u)) uploadUrls.add(p.requestId);
+      if (/invocations\/files\/upload|attachments\/presigned-url/i.test(u)) {
+        uploadUrls.set(p.requestId, u);
+      }
     });
     scope.Network.loadingFinished((p) => {
       if (uploadUrls.has(p.requestId)) done.add(p.requestId);
     });
+  } catch (_) {}
+
+  // 注入前先清掉输入区残留附件：
+  // Quick 点“新对话”不会自动清掉上一轮没发出去的附件，图片又会以缩略图保留。
+  // 如果只追加新文件，模型会收到“旧图 + 新图”，用户看到的就是上传串图。
+  const clearAttachExpr = '(() => { const bs = Array.from(document.querySelectorAll(\'button[aria-label="删除附件"]\')); for (const b of bs) b.click(); return bs.length; })()';
+  let attachmentsBefore = 0;
+  try {
+    const r = await conn.Runtime.evaluate({ expression: clearAttachExpr, returnByValue: true });
+    attachmentsBefore = Number(r && r.result && r.result.value) || 0;
+    if (attachmentsBefore > 0) {
+      console.log('[Send] 已清理残留附件 ' + attachmentsBefore + ' 个');
+      await sleep(300);
+    }
+    const r2 = await conn.Runtime.evaluate({
+      expression: '(() => document.querySelectorAll(\'button[aria-label="删除附件"]\').length)()',
+      returnByValue: true,
+    });
+    attachmentsBefore = Number(r2 && r2.result && r2.result.value) || 0;
   } catch (_) {}
 
   // 3. 注入文件
@@ -427,32 +547,34 @@ export async function attachFiles(conn, filePaths, cfg) {
     return { ok: false, error: '注入文件失败: ' + e.message };
   }
 
-  // 4. 等上传完成：看到 presigned-url 和 files/upload 都结束，或等附件卡片出现
+  // 4. 等上传完成：看到 files/upload 请求结束，或附件卡片数量增加。
+  const t = timingOpts(cfg);
   const maxSec = Math.max(30, Math.ceil((cfg && cfg.fileUploadTimeoutSec) || 60));
   const deadline = Date.now() + maxSec * 1000;
   let ready = false;
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 500));
-    // 依据 1：上传请求已全部完成
-    const uploadReqDone = [...uploadUrls].some((id) => /upload/i.test(id)) || done.size >= 2;
-    // 依据 2：页面上出现了文件名（附件卡片）
+    await sleep(500);
+    // 依据 1：真正的 files/upload 请求已完成（presigned-url 只是拿签名）
+    const uploadFinished = [...uploadUrls.entries()].some(
+      ([id, url]) => done.has(id) && /invocations\/files\/upload/i.test(url),
+    );
+    // 依据 2：附件卡片出现。图片卡片没有文件名，所以同时看“删除附件”数量。
     let cardSeen = false;
     try {
       const names = paths.map((p) => p.split(/[\\/]/).pop()).filter(Boolean);
-      const expr = '(() => { const t = document.body.innerText || ""; return ' +
-        JSON.stringify(names) + '.some(n => t.includes(n)); })()';
+      const expr = '(() => { const t = document.body.innerText || ""; const byName = ' +
+        JSON.stringify(names) + '.some(n => t.includes(n)); const n = document.querySelectorAll(\'button[aria-label="删除附件"]\').length; return byName || n > ' + attachmentsBefore + '; })()';
       const r = await conn.Runtime.evaluate({ expression: expr, returnByValue: true });
       cardSeen = !!(r && r.result && r.result.value);
     } catch (_) {}
-    if (cardSeen && uploadReqDone) { ready = true; break; }
-    if (cardSeen) ready = true; // 卡片出现就认为挂上了（上传可能已被页面缓存命中）
+    if (cardSeen || uploadFinished) { ready = true; break; }
   }
 
   if (scope) scope.close();
   if (!ready) return { ok: false, error: '附件上传超时（' + maxSec + 's）' };
 
-  // 5. 再给页面一点时间把附件状态同步到发送逻辑
-  await new Promise((r) => setTimeout(r, 800));
+  // 5. 再给页面一点时间把附件状态同步到发送逻辑（可配置短等待，默认 0.3s）
+  await sleep(t.attachSyncDelayMs);
   console.log('[Send] 附件已就绪 ' + paths.length + ' 个');
   return { ok: true, count: paths.length };
 }

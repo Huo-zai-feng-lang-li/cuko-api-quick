@@ -9,11 +9,24 @@ import { pathToFileURL } from 'node:url';
 const TESTS = [];
 globalThis.__test = (name, fn) => TESTS.push({ name, fn });
 
+// 测试导入 handler 时会创建模块级 openaiSessions；显式关掉磁盘持久化，避免污染
+// 开发机真实的 data/openai-sessions.json。会话持久化本身用独立临时文件测试。
+process.env.CUKO_OPENAI_SESSION_FILE = '';
+
 const assert = (cond, msg) => { if (!cond) throw new Error(msg || '断言失败'); };
 assert.equal = (a, b, msg) => { if (a !== b) throw new Error((msg || '断言失败') + ': ' + JSON.stringify(a) + ' !== ' + JSON.stringify(b)); };
 assert.ok = (v, msg) => { if (!v) throw new Error(msg || '断言失败'); };
 assert.match = (s, re, msg) => { if (!re.test(String(s))) throw new Error((msg || '断言失败') + ': 不匹配 ' + re); };
 assert.deepEqual = (a, b, msg) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error((msg || '断言失败') + ': ' + JSON.stringify(a) + ' !== ' + JSON.stringify(b)); };
+assert.rejects = async (fn, check) => {
+  try {
+    await fn();
+  } catch (e) {
+    if (check && !check(e)) throw new Error('rejects 断言不匹配: ' + (e && e.message));
+    return e;
+  }
+  throw new Error('期望 Promise reject，但实际成功');
+};
 globalThis.__assert = assert;
 
 const dir = import.meta.dirname;

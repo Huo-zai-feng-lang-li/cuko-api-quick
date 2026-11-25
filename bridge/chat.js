@@ -19,6 +19,61 @@ import { extractThreadIdFromUrl, parseQuickUrl } from './page.js';
 const KEEPALIVE_MS = 20000;
 
 /**
+ * 点击页面上的「停止生成」按钮。
+ * 选择器与 quick-sender 的生成中判定保持一致；找不到按钮不算错误（回合可能已结束）。
+ */
+const STOP_GENERATING_EXPR = `(() => {
+  const sels = ['button[aria-label*="停止"]', 'button[aria-label*="Stop" i]'];
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 8 && r.height > 8; };
+  for (const s of sels) {
+    const nodes = Array.from(document.querySelectorAll(s)).filter(visible);
+    if (nodes.length) { nodes[nodes.length - 1].click(); return { ok: true, how: s }; }
+  }
+  return { ok: false };
+})()`;
+
+/** 日志里只保留会话 ID 的键，不落 conversationId/state 这类会话凭据。 */
+function redactUrl(text) {
+  return String(text || '').replace(/([?&](?:state|conversationId)=)[^&\s)]+/gi, '$1<redacted>');
+}
+
+/**
+ * 构造 res 'close' 处理器。
+ *
+ * 语义区分（`dispatched` 表示「本轮已收尾完成」，不是「消息已发送」）：
+ *  - 正常结束：finish() 已跑过并 res.end()，Node 随后也会触发 close；直接返回，
+ *    不点停止按钮、不 detach、不重复释放；
+ *  - 中途断连：回合还在跑，先让页面停止生成（带上限），再进入 detach 过渡期；
+ *    不置 dispatched，后续 finish() 仍能跑完收尾与附件清理。
+ *
+ * @param {object} d
+ * @param {()=>boolean} d.isDispatched 本轮是否已收尾
+ * @param {()=>boolean} d.isAborted 是否已处理过断连
+ * @param {()=>void} d.markAborted 标记已处理断连
+ * @param {()=>void} d.clearTimers 清理本轮全部定时器
+ * @param {()=>void} d.closeChannel 关闭事件通道
+ * @param {()=>Promise<void>|void} [d.stopGeneration] 点击页面停止生成按钮
+ * @param {()=>void} [d.detach] 过渡期释放槽位；缺省回退 release
+ * @param {()=>void} d.release 立即释放槽位
+ * @returns {()=>void}
+ */
+export function createCloseHandler(d) {
+  return () => {
+    if (d.isAborted()) return;
+    if (d.isDispatched()) return;
+    d.markAborted();
+    d.clearTimers();
+    d.closeChannel();
+    const fallback = typeof d.detach === 'function' ? d.detach : d.release;
+    // stopGeneration 同步发起（计数/副作用即时生效），Promise 链只约束"先停后过渡"的顺序
+    const stopResult = d.stopGeneration ? d.stopGeneration() : undefined;
+    Promise.resolve(stopResult)
+      .catch(() => {})
+      .finally(() => { if (fallback) fallback(); });
+  };
+}
+
+/**
  * 处理一次 Cuko /v1/responses 请求（普通增量对话）。
  * @param {object} ctx
  * @param {import('node:http').ServerResponse} ctx.res
@@ -28,10 +83,11 @@ const KEEPALIVE_MS = 20000;
  * @param {object} ctx.cfg 生效配置方案 values
  * @param {object} ctx.profile 生效配置方案
  * @param {(modelId:string)=>void} ctx.release 释放并发锁
+ * @param {()=>void} [ctx.detach] 客户端断开后的过渡期释放（调度器槽位）；缺省回退 release
  */
-export async function handleChat({ res, payload, account, conn, cfg, profile, release }) {
+export async function handleChat({ res, payload, account, conn, cfg, profile, release, detach }) {
   const isNewChat = !payload.providerSessionId;
-  const log = (...a) => console.log('[Chat]', ...a);
+  const log = (...a) => console.log('[Chat]', ...a.map(v => (typeof v === 'string' ? redactUrl(v) : v)));
 
   const extractor = new QuickTurnExtractor();
   let channel = null;
@@ -46,12 +102,14 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
   let idleTimer = null;
   let totalTimer = null;
   let keepAliveTimer = null;
+  let probeTimer = null;
   let firstEventSeen = false;
 
   const clearAllTimers = () => {
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     if (totalTimer) { clearTimeout(totalTimer); totalTimer = null; }
     if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+    if (probeTimer) { clearTimeout(probeTimer); probeTimer = null; }
   };
 
   /** 推首帧 / 推增量 */
@@ -200,17 +258,33 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
     release();
   };
 
-  // 客户端断开（用户点停止）→ 清理并释放锁
-  res.on('close', () => {
-    if (!dispatched) {
-      log('客户端断开，中止本轮');
-      aborted = true;
-      clearAllTimers();
-      if (channel) channel.close();
-      dispatched = true;
-      release();
+  /** 断开时尽力让页面停止生成；2s 上限，找不到按钮或连接已断都不影响收尾 */
+  const stopGenerationOnPage = async () => {
+    if (!conn) return;
+    try {
+      const r = await Promise.race([
+        conn.Runtime.evaluate({ expression: STOP_GENERATING_EXPR, returnByValue: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('停止按钮点击超时')), 2000)),
+      ]);
+      const v = r && r.result && r.result.value;
+      if (v && v.ok) log('已点击页面停止生成按钮（' + v.how + '）');
+    } catch (e) {
+      log('停止生成按钮点击失败（忽略）:', e.message);
     }
+  };
+
+  // 客户端断开：正常收尾后的 close 不动作；中途断连先停页面生成，再走过渡期 detach
+  const handleResClose = createCloseHandler({
+    isDispatched: () => dispatched,
+    isAborted: () => aborted,
+    markAborted: () => { aborted = true; },
+    clearTimers: clearAllTimers,
+    closeChannel: () => { if (channel) channel.close(); },
+    stopGeneration: stopGenerationOnPage,
+    detach,
+    release,
   });
+  res.on('close', handleResClose);
 
   try {
     // ---------- 1. 页面就绪 ----------
@@ -341,7 +415,8 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
     resetIdle();
 
     // 若短时间内没有任何事件，可能是页面没有真的发出，给出提示但不立即失败
-    setTimeout(async () => {
+    probeTimer = setTimeout(async () => {
+      probeTimer = null;
       if (dispatched || aborted || firstEventSeen) return;
       const gen = await isGenerating(conn).catch(() => false);
       log('尚未收到任何聊天事件（页面生成中=' + gen + '），继续等待…');
@@ -357,6 +432,10 @@ export async function handleChat({ res, payload, account, conn, cfg, profile, re
     }
     clearAllTimers();
     if (channel) channel.close();
+    // 附件已落盘但发送失败时也要清理，否则失败重试会不断堆积临时文件。
+    if (Array.isArray(payload._attachMeta) && payload._attachMeta.length) {
+      cleanupAttachments(payload._attachMeta);
+    }
     if (!dispatched) { dispatched = true; release(); }
   }
 }

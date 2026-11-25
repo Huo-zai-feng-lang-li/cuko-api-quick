@@ -96,11 +96,15 @@ export function saveProfiles(profiles) {
 /**
  * 根据账号的 profileId 解析出实际生效的方案。
  * profileId 为空 / 找不到 / 指向默认 → 返回默认方案。
+ *
+ * @param {object} account 账号
+ * @param {Array} [profiles] 已读出的方案列表；批量解析时传进来避免重复读文件
  */
-export function resolveProfile(account) {
+export function resolveProfile(account, profiles) {
   const pid = account && account.profileId;
   if (!pid || pid === 'default') return DEFAULT_PROFILE;
-  const found = getProfiles().find(p => p.id === pid);
+  const list = profiles || getProfiles();
+  const found = list.find(p => p.id === pid);
   if (!found) return DEFAULT_PROFILE;
   return { id: found.id, name: found.name, isDefault: false, values: found.values };
 }

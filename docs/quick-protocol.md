@@ -1,7 +1,7 @@
 # Amazon Quick 网页版聊天协议（实测）
 
 > 目标：`https://quick.aws.com/sn/account/<awsAccountId>/start/chat`
-> 抓包时间：2026-11-23，实测环境：Chrome 157 + 已登录企业账号 261414899405
+> 抓包时间：2026-11-23，实测环境：Chrome 157 + 已登录企业账号（账号 ID 已脱敏）
 > 本文所有结论均来自 Chrome DevTools Protocol（`Network.webSocketFrame*Received/Sent`）的真实抓包，
 > 原始帧样本见 `test/fixtures/quick-turn-in.json` / `quick-turn-out.json`。
 
@@ -75,7 +75,7 @@ A1                      # map(1)
   "type": "text_delta",
   "payload": { "delta": "我是 AWS ", "kernel_thread_id": "..." },
   "message_id": "msg-...",
-  "thread_id": "3e079448-101e-4a95-a95b-a3a942443ba8",
+  "thread_id": "00000000-0000-4000-8000-000000000004",
   "scope": "chat",
   "timestamp": 1795408395820
 }
@@ -188,7 +188,18 @@ Cuko 客户端 --HTTP/SSE--> bridge/index.js --CDP--> 独立 Chrome --user-data-
 2. **接收**：CDP `Network.webSocketFrameReceived` → 拆 event-stream → 解 CBOR → 按事件类型归并成 Cuko 的 `output` / `think` / `usage`。
 3. **会话续接**：把 `thread_id` 作为 `providerSessionId` 回传给客户端；续接时导航到 `?conversationId=<id>`。
 
-### 6.1 为什么不让 Node 自己连 WebSocket
+### 6.1 页面操作等待：自适应，不再固定随机长等
+
+发送链路里的等待已从「与页面状态无关的固定/随机区间」改成**条件命中即退出**的自适应轮询：
+
+- 填词后轮询核对输入框内容与预期一致（归一化空白后相等 / 包含 / 截断 ≥90% 即命中），上限 `pasteVerifyMaxSec`（默认 0.6s）；
+- 发送按钮就绪按渐进退避轮询：前 `pollRampAfterAttempts`（默认 2）次用 `pollFastSec`（默认 0.08s），之后退避到 `pollSlowSec`（默认 0.22s）；
+- 按钮就绪后只保底睡 `preEnterMinSec`（默认 0.05s）给 React 一次状态更新机会；
+- 填词失败重试间隔 `composerRetryDelaySec`（默认 0.4s）；附件挂载后短等待 `attachSyncDelaySec`（默认 0.3s）。
+
+旧的 `textPasteWaitMin/MaxSec`（1.0 / 3.0s）、`preEnterWaitMin/MaxSec`（0.8 / 2.5s）仅为兼容老配置保留，发送编排不再消费。发送确认窗口（纯文本 / 纯附件的等待上限）与回车兜底等保底路径未改动。配置项含义与调优建议见 README「配置方案」章节。
+
+### 6.2 为什么不让 Node 自己连 WebSocket
 
 - `token` 是 1 小时轮换的 id_token，`ws_host` 按租户不同，还涉及 `surfaceType`/`workingSessionId` 等握手字段；
 - 页面本来就维护着一条可用连接，凭据刷新、重连都由它负责。
@@ -215,6 +226,8 @@ POST /sn/account/<id>/qbsproxy/quicksight/accounts/<id>/invocations/files/upload
 **注意**：
 - 必须在 `DOM.enable()` 之后才能用 `setFileInputFiles`
 - 上传是异步的，要等 `files/upload` 返回或附件卡片出现，再点发送
+- 图片附件卡片**没有文件名文本**，不能靠 `body.innerText.includes(filename)` 判断；应看 `button[aria-label="删除附件"]` 数量增加，或 `files/upload` 的 loadingFinished
+- 注入前先清掉输入区残留的“删除附件”卡片；Quick 点“新对话”不会自动清空未发送的附件
 - 纯附件消息的 textarea 本来就是空的，不能因为「输入框为空」判定发送失败
 
 ## 八、心跳与长静默
@@ -229,6 +242,6 @@ Quick 的下行帧里有 `keepalive` 事件（`{"type":"keepalive","ts":...}`）
 ## 九、已知限制
 
 - **单账号单并发**：同一账号同时只允许一轮对话（页面上只有一份输入区）。
-- **无文件/图片输入**：当前版本只做文本；Quick 的附件走独立的 `upload-attachment` + `files/upload` 流程，未实现。
+- **文件附件已支持**：文本/PDF 等通过 `upload-attachment` + `files/upload` 上传；图片已验证 PNG 可上传并被模型读取，其他格式按 Quick 的 `accept=*` 行为处理。
 - **`webSocketCreated` 不可依赖**：见 2.1。
 - **页面必须停在聊天页**：浏览器被用户导航到别的页面后，请求会失败并给出明确错误。

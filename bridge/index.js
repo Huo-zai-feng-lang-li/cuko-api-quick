@@ -7,9 +7,13 @@
  * 端点：
  *   GET  /v1/models                      模型（账号）列表
  *   POST /v1/responses                   发送消息（SSE 流式）
+ *   GET  /openai/v1/models               OpenAI 格式模型列表
+ *   POST /openai/v1/responses            OpenAI Responses（Codex）
+ *   POST /openai/v1/chat/completions     OpenAI Chat Completions（dsh）
  *   GET  /api/accounts                   账号列表
  *   POST /api/accounts                   新增账号（自动启动 Chrome）
- *   PUT  /api/accounts/:id               改名 / 绑配置方案
+ *   POST /api/shutdown                   停止服务并关闭本服务托管的 Quick 页签
+ *   PUT  /api/accounts/:id               绑配置方案
  *   DELETE /api/accounts/:id             删除账号（含独立数据目录）
  *   POST /api/accounts/:id/open          打开 Chrome
  *   GET  /api/accounts/:id/health        账号健康检查
@@ -27,12 +31,20 @@ import { getAccounts, saveAccounts, getProfiles, saveProfiles, resolveProfile,
   ensureDataDirs, initLogFile, teeConsoleToFile, PROFILES_DIR, getAccountHealth, saveAccountHealth } from './store.js';
 import { DEFAULT_PROFILE_VALUES, FIELD_LABELS, validateProfile } from './default-config.js';
 import { readUiIndexHtml } from './app-paths.js';
-import { launchChrome, probePort, resolveChromePath, ensureConnection } from './chrome.js';
+import { launchChrome, probePort, isPortFree, resolveChromePath, ensureConnection, closeChrome, dedupeQuickTabs } from './chrome.js';
+import { createAccountScheduler, effectiveModelAlias, groupAccountsByAlias, listModelAliases } from './account-scheduler.js';
+import { createChromePool } from './chrome-pool.js';
+import { makeAccountHealthCheck } from './account-health.js';
+import { createSerialLock } from './serial-lock.js';
+import { validateAccountInput, generateUniqueAccountId, listProfileDirNames } from './account-id.js';
 import { getConnection, closeConnection, closeAllConnections } from './cdp-connection.js';
 import { handleChat } from './chat.js';
 import { handleCompress } from './compress.js';
 import { checkAccountHealth } from './health.js';
 import { normalizeInputItems } from './input.js';
+// [261123-openai] OpenAI Responses / Chat Completions 兼容入口：
+// Codex、dsh 等标准客户端走 /openai/v1，不复用 Cuko 自定义 /v1/responses。
+import { handleOpenAIRequest } from './openai/handler.js';
 // [261123-attach] 超长文本转附件：客户端发来的工具调用结果动辄几万字符，
 // 直接塞进输入框既慢又容易被页面截断，改成落文件走 Quick 的附件通道。详见 docs/quick-protocol.md
 import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD } from './attachments.js';
@@ -41,6 +53,8 @@ import { splitOversizedTexts, materializeFileItems, TEXT_TO_FILE_THRESHOLD } fro
 import { resolveRuntimeConfig, ensureRuntimeConfigFile, portInUseHint, RUNTIME_CONFIG_FILE } from './runtime-config.js';
 // [261123-open-admin] 启动后自动打开管理后台
 import { openInBrowser } from './open-browser.js';
+// 启动预热放在独立模块，避免 index.js 继续膨胀
+import { warmupAccounts } from './warmup.js';
 
 const BASE_DEBUG_PORT = 9222;
 
@@ -53,8 +67,70 @@ const LOG_FILE = initLogFile();
 teeConsoleToFile();
 console.log('[bridge] 日志落盘:', LOG_FILE);
 
-/** 每个模型同一时间只允许一轮对话 */
-const activeModels = new Set();
+/**
+ * 账号池调度器：对外模型别名 -> 内部账号池。
+ * 每个账号同时只跑一轮 Quick；同账号的后续请求排队，不同账号并行。
+ */
+const scheduler = createAccountScheduler({
+  maxQueuePerAccount: runtimeCfg.maxQueuePerAccount,
+  maxWaitMs: runtimeCfg.queueMaxWaitSec * 1000,
+  detachedGraceMs: runtimeCfg.detachedGraceSec * 1000,
+});
+
+/**
+ * 常驻 Chrome 资源池：空闲回收、常驻上限 LRU 淘汰、页签去重、后台轮询。
+ * 关闭动作复用 chrome.js 的受管 Chrome 关闭流程（含 profile 归属校验）。
+ */
+const pool = createChromePool({
+  cfg: runtimeCfg,
+  getStats: (id) => scheduler.statsFor(id),
+  actions: {
+    probeOnline: async (account) => probePort(account.debugPort, 300),
+    closeChrome,
+    closeConnection: async (accountId) => closeConnection(accountId),
+    dedupeTabs: (account) => dedupeQuickTabs(account),
+  },
+});
+
+/** 每个模型当前在途的 SSE 响应；删除账号时主动断开，避免挂到超时 */
+const activeResponses = new Map();
+
+/** 停止服务只允许触发一次，避免并发点击导致重复清理 */
+let shuttingDown = false;
+
+/**
+ * 停止 HTTP 服务、关闭在途请求和本服务托管的 Quick 页签。
+ * 不删除 data/ 或账号 profile；用户自己的 Chrome 不会被触碰。
+ */
+async function shutdownService() {
+  console.log('[bridge] 管理台请求停止服务，正在关闭…');
+
+  // 1) 先停止接收新请求，避免清理过程中又进来新任务
+  try { server.close(); } catch (_) {}
+
+  // 2) 断开在途 SSE，释放调度器和并发槽位
+  scheduler.cancelAll('服务正在停止');
+  for (const sink of activeResponses.values()) {
+    try { sink.destroy(); } catch (_) {}
+  }
+  activeResponses.clear();
+
+  // 3) 断开 CDP 常驻连接，避免退出时留下 socket
+  try { await closeAllConnections(); } catch (_) {}
+
+  // 4) 逐个回收受管 Chrome（关页签 + 释放调试端口），不停留在“只关页签”状态
+  await pool.shutdown(getAccounts());
+
+  // 5) 强制断开剩余 HTTP 连接，再退出进程
+  if (typeof server.closeAllConnections === 'function') {
+    try { server.closeAllConnections(); } catch (_) {}
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  process.exit(0);
+}
+
+/** 账号/方案是“读-改-写”文件，管理接口必须串行，避免并发覆盖 */
+const withConfigLock = createSerialLock();
 
 /** 统一的 JSON 响应 */
 function sendJson(res, status, obj) {
@@ -70,11 +146,23 @@ async function readBody(req) {
   return body;
 }
 
-/** 分配调试端口（当前最大值 +1） */
-function allocDebugPort(accounts) {
-  let maxPort = BASE_DEBUG_PORT;
-  for (const a of accounts) if (a.debugPort && a.debugPort > maxPort) maxPort = a.debugPort;
-  return maxPort + 1;
+/**
+ * 从 9222 起找第一个可用调试端口。
+ *
+ * 不能只按 accounts.json 里的最大值 +1：删号后旧 Chrome 可能还占着端口，
+ * 新账号会拿到同一个端口，然后 probePort 一通就连接到旧账号的登录态上。
+ * 这里同时排除“已被账号登记”和“当前有任意进程监听”的端口。
+ *
+ * @param {Array<{debugPort?:number}>} accounts
+ * @returns {Promise<number>}
+ */
+async function allocDebugPort(accounts) {
+  const used = new Set(accounts.map(a => a.debugPort).filter(Boolean));
+  for (let port = BASE_DEBUG_PORT; port < BASE_DEBUG_PORT + 200; port++) {
+    if (used.has(port)) continue;
+    if (await isPortFree(port)) return port;
+  }
+  throw new Error('9222 起没有可用调试端口（已检查 200 个），请先关闭不用的 Chrome');
 }
 
 const server = http.createServer(async (req, res) => {
@@ -107,11 +195,61 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 管理台「停止服务」：先结束这次 HTTP 响应，再异步清理并退出进程。
+  if (req.method === 'POST' && pathname === '/api/shutdown') {
+    if (shuttingDown) {
+      sendJson(res, 202, { success: true, message: '服务正在停止' });
+      return;
+    }
+    shuttingDown = true;
+    sendJson(res, 200, { success: true, message: '服务正在停止，浏览器页签将关闭' });
+    setTimeout(() => {
+      shutdownService().catch((e) => {
+        console.error('[bridge] 停止服务失败:', e && e.message);
+        process.exit(1);
+      });
+    }, 50);
+    return;
+  }
+
+  // ============ OpenAI 兼容入口 ============
+  // Codex / dsh 等标准客户端使用 /openai/v1，避免和 Cuko 老协议冲突。
+  if (pathname === '/openai/v1' || pathname.startsWith('/openai/v1/')) {
+    try {
+      await handleOpenAIRequest({
+        req,
+        res,
+        pathname,
+        deps: {
+          getAccounts,
+          getAccountHealth,
+          resolveProfile,
+          ensureConnection,
+          getConnection,
+          handleChat,
+          scheduler,
+          activeResponses,
+          isRecycling: (id) => pool.isRecycling(id),
+          touchAccount: (id) => pool.touch(id),
+        },
+      });
+    } catch (e) {
+      // 入口层自身出错（比如账号文件读取失败）也不能把进程打挂。
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: { message: e.message || '内部错误', type: 'server_error', code: 'internal_error' } });
+      } else {
+        try { res.end(); } catch (_) {}
+      }
+    }
+    return;
+  }
+
   // ============ Cuko API ============
   if (req.method === 'GET' && pathname === '/v1/models') {
-    const accounts = getAccounts();
+    const aliases = listModelAliases(getAccounts());
     sendJson(res, 200, {
-      data: accounts.map(a => ({ id: a.modelId, name: a.modelName || a.modelId })),
+      // 对外只暴露别名；同名账号自动聚合成一个模型（池）。
+      data: aliases.map(a => ({ id: a.alias, name: a.alias })),
     });
     return;
   }
@@ -120,31 +258,6 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     let payload;
     try { payload = JSON.parse(body); } catch { sendJson(res, 400, { code: 'invalid_request', message: 'Bad JSON' }); return; }
-
-    const account = getAccounts().find(a => a.modelId === payload.model);
-    if (!account) {
-      sendJson(res, 404, { code: 'invalid_request', message: 'Model not found: ' + payload.model });
-      return;
-    }
-
-    // 健康闸门：已知限额/封号/未登录时直接拒绝，避免白等
-    const health = getAccountHealth()[account.modelId];
-    if (health && health.state && health.state !== 'ok') {
-      const now = Date.now();
-      if (health.state === 'login_required' && health.checkedAt && (now - health.checkedAt) < 30 * 60 * 1000) {
-        sendJson(res, 401, { code: 'authentication_required', message: '账号未登录或登录失效，请重新登录 quick.aws.com 后再试' });
-        return;
-      }
-      if (health.state === 'quota_exceeded' && health.resetAt && health.resetAt > now) {
-        sendJson(res, 429, { code: 'rate_limit_exceeded', message: '账号额度已用完，预计 ' + new Date(health.resetAt).toLocaleString('sv-SE') + ' 恢复' });
-        return;
-      }
-    }
-
-    if (activeModels.has(payload.model)) {
-      sendJson(res, 429, { code: 'rate_limit_exceeded', message: '同一模型只能同时进行一轮对话' });
-      return;
-    }
 
     // 归一化输入
     const norm = normalizeInputItems(payload.input);
@@ -186,8 +299,53 @@ const server = http.createServer(async (req, res) => {
     payload._attachFiles = allFiles.map(f => f.filePath);
     payload._attachMeta = allFiles;
 
-    activeModels.add(payload.model);
-    const release = () => activeModels.delete(payload.model);
+    const accounts = getAccounts();
+    const healthMap = getAccountHealth();
+    const healthCheck = makeAccountHealthCheck(healthMap);
+    // 正在回收中的账号不接新请求，调度器按规则挑其它健康账号
+    const accountError = (acc) => {
+      if (pool.isRecycling(acc.modelId)) {
+        return { statusCode: 503, code: 'account_unavailable', message: '账号正在回收，请稍后重试' };
+      }
+      return healthCheck(acc);
+    };
+    const ac = new AbortController();
+    let acquired = null;
+    let released = false;
+    const onClose = () => {
+      if (res.writableEnded) return;
+      ac.abort();
+      if (acquired) release();
+    };
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (acquired) acquired.release();
+      const account = acquired && acquired.account;
+      if (account && activeResponses.get(account.modelId) === res) activeResponses.delete(account.modelId);
+      try { res.off('close', onClose); } catch (_) {}
+    };
+    res.on('close', onClose);
+
+    try {
+      acquired = await scheduler.acquire({
+        accounts,
+        alias: String(payload.model || '').trim(),
+        accountError,
+        signal: ac.signal,
+      });
+    } catch (e) {
+      try { res.off('close', onClose); } catch (_) {}
+      if (!res.writableEnded) {
+        sendJson(res, e.statusCode || 503, { code: e.code || 'provider_unavailable', message: e.message });
+      }
+      return;
+    }
+
+    const account = acquired.account;
+    const profile = resolveProfile(account);
+    if (res.writableEnded) { release(); return; }
+    activeResponses.set(account.modelId, res);
 
     // SSE 头
     res.writeHead(200, {
@@ -198,14 +356,14 @@ const server = http.createServer(async (req, res) => {
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
     if (res.socket) res.socket.setNoDelay(true);
 
-    const profile = resolveProfile(account);
     try {
       // [261123-autolaunch] Chrome 被关掉时自动拉起，而不是把 ECONNREFUSED 甩给客户端。
       const conn = await ensureConnection(account, profile.values, getConnection, 'quick.aws.com');
+      pool.touch(account.modelId);
       if (payload.type === 'compress') {
         await handleCompress({ res, payload, account, conn, cfg: profile.values, profile, release });
       } else {
-        await handleChat({ res, payload, account, conn, cfg: profile.values, profile, release });
+        await handleChat({ res, payload, account, conn, cfg: profile.values, profile, release, detach: acquired.detach });
       }
     } catch (e) {
       console.error('[bridge] 处理请求失败:', e.message);
@@ -213,11 +371,12 @@ const server = http.createServer(async (req, res) => {
       if (!res.writableEnded) {
         try {
           res.write('event: error\n');
-          res.write('data: ' + JSON.stringify({ code: 'internal_error', message: e.message }) + '\n\n');
+          res.write('data: ' + JSON.stringify({ code: e.code || 'internal_error', message: e.message }) + '\n\n');
           res.end();
         } catch (_) {}
       }
     }
+    if (!released) release();
     return;
   }
 
@@ -225,13 +384,21 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/api/accounts') {
     const accounts = getAccounts();
     const healthMap = getAccountHealth();
-    for (const acc of accounts) {
-      acc.status = (await probePort(acc.debugPort)) ? 'online' : 'offline';
-      const eff = resolveProfile(acc);
+    const profiles = getProfiles();
+    const groups = groupAccountsByAlias(accounts);
+    // 并行探活：以前是 for 里 await，账号多/端口卡住时一轮能拖几秒
+    await Promise.all(accounts.map(async (acc) => {
+      acc.modelAlias = effectiveModelAlias(acc);
+      acc.poolSize = (groups.get(acc.modelAlias) || []).length;
+      const st = scheduler.statsFor(acc.modelId);
+      acc.active = st.active;
+      acc.queued = st.queued;
+      acc.status = (await probePort(acc.debugPort, 300)) ? 'online' : 'offline';
+      const eff = resolveProfile(acc, profiles);
       acc.profileId = acc.profileId || 'default';
       acc.profileName = eff.name;
       acc.health = healthMap[acc.modelId] || null;
-    }
+    }));
     sendJson(res, 200, accounts);
     return;
   }
@@ -240,23 +407,47 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     let data;
     try { data = JSON.parse(body); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
-    if (!data.modelId || !data.modelName) { sendJson(res, 400, { error: '缺少 modelId / modelName' }); return; }
-    if (!/^[a-zA-Z0-9_-]+$/.test(data.modelId)) { sendJson(res, 400, { error: 'modelId 仅支持英文、数字、下划线、中划线' }); return; }
+    const input = validateAccountInput(data);
+    if (!input.ok) { sendJson(res, input.status, { error: input.error }); return; }
 
-    const accounts = getAccounts();
-    if (accounts.find(a => a.modelId === data.modelId)) { sendJson(res, 409, { error: '该 ID 已存在' }); return; }
+    await withConfigLock(async () => {
+      const accounts = getAccounts();
+      let modelId = input.modelId;
+      if (modelId) {
+        if (accounts.find(a => a.modelId === modelId)) { sendJson(res, 409, { error: '该 ID 已存在' }); return; }
+      } else {
+        // 锁内生成：同时排除 accounts.json 已有 ID 与 profiles 目录已存在的目录名，
+        // 连续并发新增也不会拿到同一个 ID。
+        modelId = generateUniqueAccountId(accounts, listProfileDirNames(PROFILES_DIR));
+      }
 
-    let profileId = 'default';
-    if (data.profileId && data.profileId !== 'default') {
-      if (!getProfiles().find(p => p.id === data.profileId)) { sendJson(res, 400, { error: '指定的配置方案不存在' }); return; }
-      profileId = data.profileId;
-    }
+      let profileId = 'default';
+      if (data.profileId && data.profileId !== 'default') {
+        if (!getProfiles().find(p => p.id === data.profileId)) { sendJson(res, 400, { error: '指定的配置方案不存在' }); return; }
+        profileId = data.profileId;
+      }
 
-    const account = { modelId: data.modelId, modelName: data.modelName, debugPort: allocDebugPort(accounts), profileId, createdAt: Date.now() };
-    accounts.push(account);
-    saveAccounts(accounts);
-    launchChrome(account, resolveProfile(account).values);
-    sendJson(res, 200, { success: true, account });
+      let debugPort;
+      try {
+        debugPort = await allocDebugPort(accounts);
+      } catch (e) {
+        sendJson(res, 500, { error: e.message });
+        return;
+      }
+
+      // modelId 是内部唯一身份；modelAlias 是对外模型名，同别名自动组成账号池。
+      const account = { modelId, modelAlias: input.modelAlias, debugPort, profileId, createdAt: Date.now() };
+      accounts.push(account);
+      try {
+        saveAccounts(accounts);
+      } catch (e) {
+        sendJson(res, 500, { error: '写入 accounts.json 失败：' + e.message });
+        return;
+      }
+      const started = launchChrome(account, resolveProfile(account).values);
+      if (started) pool.touch(account.modelId);
+      sendJson(res, 200, { success: true, account });
+    });
     return;
   }
 
@@ -265,32 +456,111 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     let data;
     try { data = JSON.parse(body); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
-    const accounts = getAccounts();
-    const acc = accounts.find(a => a.modelId === modelId);
-    if (!acc) { sendJson(res, 404, { error: 'Not found' }); return; }
-    if (data.modelName) acc.modelName = data.modelName;
-    if (data.profileId !== undefined) {
-      if (!data.profileId || data.profileId === 'default') acc.profileId = 'default';
-      else if (!getProfiles().find(p => p.id === data.profileId)) { sendJson(res, 400, { error: '指定的配置方案不存在' }); return; }
-      else acc.profileId = data.profileId;
-    }
-    saveAccounts(accounts);
-    sendJson(res, 200, { success: true });
+    await withConfigLock(async () => {
+      const accounts = getAccounts();
+      const acc = accounts.find(a => a.modelId === modelId);
+      if (!acc) { sendJson(res, 404, { error: 'Not found' }); return; }
+      if (data.modelAlias !== undefined) {
+        const alias = String(data.modelAlias || '').trim();
+        if (alias) {
+          if (alias.length > 80 || !/^[a-zA-Z0-9._:-]+$/.test(alias)) {
+            sendJson(res, 400, { error: 'modelAlias 仅支持英文、数字、点、下划线、冒号、中划线，且不超过 80 字符' });
+            return;
+          }
+          acc.modelAlias = alias;
+        } else {
+          delete acc.modelAlias; // 清空后回退到 modelId
+        }
+      }
+      if (data.profileId !== undefined) {
+        if (!data.profileId || data.profileId === 'default') acc.profileId = 'default';
+        else if (!getProfiles().find(p => p.id === data.profileId)) { sendJson(res, 400, { error: '指定的配置方案不存在' }); return; }
+        else acc.profileId = data.profileId;
+      }
+      try {
+        saveAccounts(accounts);
+      } catch (e) {
+        sendJson(res, 500, { error: '写入 accounts.json 失败：' + e.message });
+        return;
+      }
+      sendJson(res, 200, { success: true });
+    });
     return;
   }
 
   if (req.method === 'DELETE' && pathname.startsWith('/api/accounts/')) {
     const modelId = decodeURIComponent(pathname.split('/')[3] || '');
-    let accounts = getAccounts();
-    if (!accounts.find(a => a.modelId === modelId)) { sendJson(res, 404, { error: 'Not found' }); return; }
-    accounts = accounts.filter(a => a.modelId !== modelId);
-    saveAccounts(accounts);
-    try { await closeConnection(modelId); } catch (_) {}
-    try {
+    await withConfigLock(async () => {
+      const accounts = getAccounts();
+      const acc = accounts.find(a => a.modelId === modelId);
+      if (!acc) { sendJson(res, 404, { error: 'Not found' }); return; }
+
+      // 1) 先断开在途 SSE，避免旧请求继续往页面里写、挂到空闲超时才释放
+      const active = activeResponses.get(modelId);
+      if (active) { try { active.destroy(); } catch (_) {} }
+      scheduler.cancelAccount(modelId, '账号已删除');
+      activeResponses.delete(modelId);
+
+      // 2) 断开 CDP（只是本进程到 Chrome 的调试连接，不会关浏览器）
+      try { await closeConnection(modelId); } catch (_) {}
+      pool.removeAccount(modelId);
+
+      // 3) 关掉这个账号的 Chrome，并确认调试端口真的释放
+      let closed;
+      try {
+        closed = await closeChrome(acc);
+      } catch (e) {
+        closed = { ok: false, error: e.message };
+      }
+      if (!closed.ok) {
+        sendJson(res, 500, { error: '账号未删除：' + closed.error });
+        return;
+      }
+
+      // 4) 删登录态目录；删不掉就保留账号记录，允许用户重试
       const dir = path.join(PROFILES_DIR, modelId);
-      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 500 });
-    } catch (e) { console.error('[accounts] 删除数据目录失败:', e.message); }
-    sendJson(res, 200, { success: true });
+      if (fs.existsSync(dir)) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+        } catch (e) {
+          console.error('[accounts] 删除数据目录失败:', e.message);
+        }
+      }
+      if (fs.existsSync(dir)) {
+        sendJson(res, 500, {
+          error: 'Chrome 已关闭，但登录态目录删除失败（可能仍被其它程序占用）。账号记录已保留，请关闭相关窗口后重试',
+        });
+        return;
+      }
+
+      // 5) 所有资源都清理成功后才提交账号删除
+      try {
+        saveAccounts(accounts.filter(a => a.modelId !== modelId));
+      } catch (e) {
+        console.error('[accounts] 写入 accounts.json 失败:', e.message);
+        sendJson(res, 500, {
+          error: 'Chrome 和登录态目录已清理，但 accounts.json 写入失败：' + e.message + '。账号记录仍在，请重试删除',
+        });
+        return;
+      }
+
+      // 6) 清掉健康记录，避免重新添加同 ID 时被旧状态挡住
+      const health = getAccountHealth();
+      if (health[modelId]) {
+        delete health[modelId];
+        try {
+          saveAccountHealth(health);
+        } catch (e) {
+          console.error('[accounts] 写入 account-health.json 失败:', e.message);
+        }
+      }
+
+      sendJson(res, 200, {
+        success: true,
+        chromeClosed: closed.method || 'closed',
+        profileRemoved: true,
+      });
+    });
     return;
   }
 
@@ -298,7 +568,15 @@ const server = http.createServer(async (req, res) => {
     const modelId = decodeURIComponent(pathname.split('/')[3] || '');
     const account = getAccounts().find(a => a.modelId === modelId);
     if (!account) { sendJson(res, 404, { error: 'Not found' }); return; }
-    launchChrome(account, resolveProfile(account).values);
+    // 端口已经在跑时不要再 spawn 第二个 Chrome（同 profile 会闪退），
+    // 手动打开也视为一次使用，刷新池活跃时间，避免 60s 后被 idle sweep 回收。
+    if (await probePort(account.debugPort, 300)) {
+      pool.touch(modelId);
+      sendJson(res, 200, { success: true });
+      return;
+    }
+    const started = launchChrome(account, resolveProfile(account).values);
+    if (started) pool.touch(modelId);
     sendJson(res, 200, { success: true });
     return;
   }
@@ -310,6 +588,8 @@ const server = http.createServer(async (req, res) => {
     try {
       const cfg = resolveProfile(account).values;
       const r = await checkAccountHealth(account, cfg);
+      // 健康检查也可能顺手拉起 Chrome；同样算一次使用，避免刚打开就被回收。
+      pool.touch(modelId);
       const record = { modelId, ...r, checkedAt: Date.now() };
       const map = getAccountHealth();
       map[modelId] = record;
@@ -340,11 +620,18 @@ const server = http.createServer(async (req, res) => {
     let values;
     try { values = data.values ? validateProfile(data.values) : validateProfile({ ...DEFAULT_PROFILE_VALUES }); }
     catch (e) { sendJson(res, 400, { error: e.message }); return; }
-    const profiles = getProfiles();
-    const created = { id: 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name, values, createdAt: Date.now() };
-    profiles.push(created);
-    saveProfiles(profiles);
-    sendJson(res, 200, created);
+    await withConfigLock(async () => {
+      const profiles = getProfiles();
+      const created = { id: 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name, values, createdAt: Date.now() };
+      profiles.push(created);
+      try {
+        saveProfiles(profiles);
+      } catch (e) {
+        sendJson(res, 500, { error: '写入 profiles.json 失败：' + e.message });
+        return;
+      }
+      sendJson(res, 200, created);
+    });
     return;
   }
 
@@ -354,33 +641,54 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     let data;
     try { data = JSON.parse(body); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
-    const profiles = getProfiles();
-    const p = profiles.find(x => x.id === id);
-    if (!p) { sendJson(res, 404, { error: 'Not found' }); return; }
-    if (data.name !== undefined) {
-      const name = String(data.name || '').trim();
-      if (!name) { sendJson(res, 400, { error: '名称不能为空' }); return; }
-      p.name = name;
-    }
-    if (data.values !== undefined) {
-      try { p.values = validateProfile(data.values); } catch (e) { sendJson(res, 400, { error: e.message }); return; }
-    }
-    saveProfiles(profiles);
-    sendJson(res, 200, p);
+    await withConfigLock(async () => {
+      const profiles = getProfiles();
+      const p = profiles.find(x => x.id === id);
+      if (!p) { sendJson(res, 404, { error: 'Not found' }); return; }
+      if (data.name !== undefined) {
+        const name = String(data.name || '').trim();
+        if (!name) { sendJson(res, 400, { error: '名称不能为空' }); return; }
+        p.name = name;
+      }
+      if (data.values !== undefined) {
+        try { p.values = validateProfile(data.values); } catch (e) { sendJson(res, 400, { error: e.message }); return; }
+      }
+      try {
+        saveProfiles(profiles);
+      } catch (e) {
+        sendJson(res, 500, { error: '写入 profiles.json 失败：' + e.message });
+        return;
+      }
+      sendJson(res, 200, p);
+    });
     return;
   }
 
   if (req.method === 'DELETE' && pathname.startsWith('/api/profiles/')) {
     const id = decodeURIComponent(pathname.split('/')[3] || '');
     if (id === 'default') { sendJson(res, 403, { error: '默认方案不可删除' }); return; }
-    const profiles = getProfiles();
-    if (!profiles.find(x => x.id === id)) { sendJson(res, 404, { error: 'Not found' }); return; }
-    saveProfiles(profiles.filter(x => x.id !== id));
-    const accounts = getAccounts();
-    let affected = 0;
-    for (const acc of accounts) if (acc.profileId === id) { acc.profileId = 'default'; affected++; }
-    if (affected) saveAccounts(accounts);
-    sendJson(res, 200, { success: true, affectedAccounts: affected });
+    await withConfigLock(async () => {
+      const profiles = getProfiles();
+      if (!profiles.find(x => x.id === id)) { sendJson(res, 404, { error: 'Not found' }); return; }
+      try {
+        saveProfiles(profiles.filter(x => x.id !== id));
+      } catch (e) {
+        sendJson(res, 500, { error: '写入 profiles.json 失败：' + e.message });
+        return;
+      }
+      const accounts = getAccounts();
+      let affected = 0;
+      for (const acc of accounts) if (acc.profileId === id) { acc.profileId = 'default'; affected++; }
+      if (affected) {
+        try {
+          saveAccounts(accounts);
+        } catch (e) {
+          sendJson(res, 500, { error: '方案已删除，但 accounts.json 写入失败：' + e.message });
+          return;
+        }
+      }
+      sendJson(res, 200, { success: true, affectedAccounts: affected });
+    });
     return;
   }
 
@@ -419,12 +727,20 @@ server.listen(HTTP_PORT, HTTP_HOST, async () => {
   } else {
     console.log('[Cuko Provider] autoOpenAdmin 已关闭，请手动打开上面的地址');
   }
+
+  // 后台回收轮询：空闲回收 + 常驻上限淘汰；间隔 0 时不启动。
+  pool.startSweep(getAccounts);
+
+  // 后台预热，不阻塞管理台打开；失败只告警，第一次请求仍会自动拉起。
+  warmupAccounts(runtimeCfg, (account) => pool.touch(account.modelId)).catch((e) => console.warn('[warmup] 预热异常:', e.message));
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, async () => {
     console.log('\n[bridge] 收到 ' + sig + '，正在关闭…');
+    pool.stopSweep();
     try { await closeAllConnections(); } catch (_) {}
+    try { await pool.shutdown(getAccounts()); } catch (_) {}
     process.exit(0);
   });
 }

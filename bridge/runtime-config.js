@@ -24,6 +24,29 @@ export const DEFAULT_RUNTIME_CONFIG = Object.freeze({
   host: '127.0.0.1',
   /** 启动后是否自动用默认浏览器打开管理后台 */
   autoOpenAdmin: true,
+  /** 每个账号最多允许几个请求排队（同一账号只能一轮对话） */
+  maxQueuePerAccount: 8,
+  /** 排队最长等待秒数；超过就返回 429，避免请求无限挂住 */
+  queueMaxWaitSec: 60,
+  /** 启动后是否后台预热账号（打开 Chrome + Quick 页签） */
+  warmupOnStart: true,
+  /** 最多预热几个账号，控制内存；其余账号等第一次请求再拉起 */
+  warmupLimit: 2,
+  /**
+   * 账号闲置多少秒后回收其受管 Chrome（保留 profile 目录与登录态）。
+   * 0 = 关闭空闲回收；默认 600s 足够宽松，刚用完还要复用不会被立刻关掉。
+   */
+  idleChromeSec: 600,
+  /** 同时常驻的 Chrome 数量上限；超出时按最久未用回收。0 = 不限制 */
+  maxResidentChrome: 4,
+  /** 后台回收轮询间隔（秒）；0 = 关闭后台轮询（只在请求/删除时触发整理） */
+  sweepIntervalSec: 60,
+  /**
+   * 回合进行中客户端断开后，槽位过渡期（秒）；正常收尾后的 close 不进入过渡期。
+   * 过渡期内旧回合跑完即释放；到点仍未结束则强制释放，避免无人接收的回合永久占槽。
+   * 0 = 断开立即释放槽位。
+   */
+  detachedGraceSec: 15,
 });
 
 /**
@@ -53,11 +76,27 @@ export function ensureRuntimeConfigFile() {
         '      改成 0.0.0.0 可以让局域网访问，但本项目没有鉴权，请自行评估风险。',
         'autoOpenAdmin：启动后是否自动打开管理后台页面，默认 true。',
         '      如果你把服务跑在服务器上、或者不想每次弹浏览器，改成 false。',
+        'maxQueuePerAccount：单账号最多排几个请求，默认 8。',
+        'queueMaxWaitSec：排队最长等待秒数，默认 60；超时返回 429。',
+        'warmupOnStart：启动后是否后台预热账号，默认 true。',
+        'warmupLimit：最多预热几个账号，默认 2；账号多时控制内存。',
+        'idleChromeSec：账号闲置多少秒后回收其受管 Chrome（保留登录态目录），默认 600；0 关闭回收。',
+        'maxResidentChrome：同时常驻 Chrome 数量上限，超出按最久未用回收，默认 4；0 不限制。',
+        'sweepIntervalSec：后台回收轮询间隔秒数，默认 60；0 关闭后台轮询。',
+        'detachedGraceSec：回合进行中断开后槽位过渡期秒数，默认 15；0 断开立即释放。',
         '环境变量 CUKO_HTTP_PORT 优先级高于本文件。',
       ],
       port: DEFAULT_RUNTIME_CONFIG.port,
       host: DEFAULT_RUNTIME_CONFIG.host,
       autoOpenAdmin: DEFAULT_RUNTIME_CONFIG.autoOpenAdmin,
+      maxQueuePerAccount: DEFAULT_RUNTIME_CONFIG.maxQueuePerAccount,
+      queueMaxWaitSec: DEFAULT_RUNTIME_CONFIG.queueMaxWaitSec,
+      warmupOnStart: DEFAULT_RUNTIME_CONFIG.warmupOnStart,
+      warmupLimit: DEFAULT_RUNTIME_CONFIG.warmupLimit,
+      idleChromeSec: DEFAULT_RUNTIME_CONFIG.idleChromeSec,
+      maxResidentChrome: DEFAULT_RUNTIME_CONFIG.maxResidentChrome,
+      sweepIntervalSec: DEFAULT_RUNTIME_CONFIG.sweepIntervalSec,
+      detachedGraceSec: DEFAULT_RUNTIME_CONFIG.detachedGraceSec,
     };
     fs.writeFileSync(RUNTIME_CONFIG_FILE, JSON.stringify(body, null, 2), 'utf8');
     return true;
@@ -77,7 +116,26 @@ export function resolveRuntimeConfig() {
   let port = DEFAULT_RUNTIME_CONFIG.port;
   let host = DEFAULT_RUNTIME_CONFIG.host;
   let autoOpenAdmin = DEFAULT_RUNTIME_CONFIG.autoOpenAdmin;
+  let maxQueuePerAccount = DEFAULT_RUNTIME_CONFIG.maxQueuePerAccount;
+  let queueMaxWaitSec = DEFAULT_RUNTIME_CONFIG.queueMaxWaitSec;
+  let warmupOnStart = DEFAULT_RUNTIME_CONFIG.warmupOnStart;
+  let warmupLimit = DEFAULT_RUNTIME_CONFIG.warmupLimit;
+  let idleChromeSec = DEFAULT_RUNTIME_CONFIG.idleChromeSec;
+  let maxResidentChrome = DEFAULT_RUNTIME_CONFIG.maxResidentChrome;
+  let sweepIntervalSec = DEFAULT_RUNTIME_CONFIG.sweepIntervalSec;
+  let detachedGraceSec = DEFAULT_RUNTIME_CONFIG.detachedGraceSec;
   let portSource = '默认值';
+
+  const readInt = (value, fallback, min, max) => {
+    if (value === undefined || value === null || String(value).trim() === '') return fallback;
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < min || n > max) return fallback;
+    return n;
+  };
+  const readBool = (value, fallback) => {
+    if (value === undefined || value === null || value === '') return fallback;
+    return !(value === false || value === 'false' || value === 0 || value === '0');
+  };
 
   // 1) 配置文件
   if (file.port !== undefined) {
@@ -97,11 +155,22 @@ export function resolveRuntimeConfig() {
 
   // 布尔开关：字符串 'false' 也当 false 处理（方便手工编辑 json）
   if (file.autoOpenAdmin !== undefined) {
-    const v = file.autoOpenAdmin;
-    autoOpenAdmin = !(v === false || v === 'false' || v === 0 || v === '0');
+    autoOpenAdmin = readBool(file.autoOpenAdmin, autoOpenAdmin);
   }
+  maxQueuePerAccount = readInt(file.maxQueuePerAccount, maxQueuePerAccount, 0, 100);
+  queueMaxWaitSec = readInt(file.queueMaxWaitSec, queueMaxWaitSec, 1, 600);
+  warmupOnStart = readBool(file.warmupOnStart, warmupOnStart);
+  warmupLimit = readInt(file.warmupLimit, warmupLimit, 0, 50);
+  idleChromeSec = readInt(file.idleChromeSec, idleChromeSec, 0, 3600);
+  maxResidentChrome = readInt(file.maxResidentChrome, maxResidentChrome, 0, 50);
+  sweepIntervalSec = readInt(file.sweepIntervalSec, sweepIntervalSec, 0, 600);
+  detachedGraceSec = readInt(file.detachedGraceSec, detachedGraceSec, 0, 120);
 
-  return { port, host, portSource, autoOpenAdmin };
+  return {
+    port, host, portSource, autoOpenAdmin,
+    maxQueuePerAccount, queueMaxWaitSec, warmupOnStart, warmupLimit,
+    idleChromeSec, maxResidentChrome, sweepIntervalSec, detachedGraceSec,
+  };
 }
 
 /** 端口被占用时给用户的建议（写进错误信息里） */

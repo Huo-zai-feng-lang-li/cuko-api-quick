@@ -169,7 +169,15 @@ export class QuickChannel {
   }
 
   close() {
+    if (this.closed) return;
     this.closed = true;
+    // 关键：作用域必须从 CdpConnection.scopes 里摘掉。
+    // 只置 closed 标记的话，每轮对话都会留下一个持有 payload / extractor / res
+    // 的闭包，CDP 每个网络事件都会遍历到它，长期运行内存和 CPU 都会线性上涨。
+    try { this.scope.close(); } catch (_) {}
+    this.onEvent = null;
+    this.onError = null;
+    this.buffer = new Uint8Array(0);
   }
 }
 

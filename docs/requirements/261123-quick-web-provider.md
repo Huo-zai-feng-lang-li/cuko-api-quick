@@ -77,7 +77,7 @@ Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件
 - [x] 首帧带 `providerSessionId`
 - [x] 续接对话保持上下文（实测：问「刚才让你记的数字」答对）
 - [x] `type: "compress"` 返回新 session
-- [x] 并发锁（同模型第二轮 429）
+- [x] 并发锁（同账号第二轮进入有界队列；队列满/超时才 429）
 - [x] 客户端断开后清理并释放锁
 - [x] 账号健康检查
 - [x] 协议层单测 9/9（真实抓包样本）
@@ -229,10 +229,34 @@ Quick 的 `thread_id` 就是会话句柄。第一轮从下行事件
 - `autoOpenAdmin: false` 时不打开，日志提示手动访问
 - 值归一化 7 种输入全部正确（含缺省、空配置、文件不存在时回退默认 true）
 
+### 261123-account-lifecycle：删除清理、端口归属与 scope 泄漏
+
+**背景**：每个账号一个独立 Chrome，但删除只删 accounts 记录和“尽力”删目录；
+Chrome 进程仍占着调试端口，新账号按 max+1 分配端口时会连到旧 Chrome，
+造成账号串号。另外 QuickChannel.close 没注销 CDP 作用域，长期运行会累积。
+
+**实现**：
+- `chrome.js` 新增 `closeChrome()`：先 `/json/close` 关页面，端口不退再
+  校验 PID 启动参数里的 `--user-data-dir`，确认是本账号后才 `taskkill /T /F`
+- `index.js` 删除顺序改为：中止在途 SSE → 断 CDP → 关 Chrome → 验端口 →
+  删 profile → 删 health → 最后写 accounts；失败保留账号，返回 500
+- 调试端口从 9222 起找“未登记且 TCP 可绑定”的端口（不只看 Chrome 调试接口）
+- 账号/方案写接口串行化，防止并发添加/删除互相覆盖 accounts.json
+- CDP 连接后用 `SystemInfo.getInfo().commandLine`（兜底 PID 命令行）校验 profile
+- `QuickChannel.close()` 补 `scope.close()`；Network 缓冲降到 20MB/10MB
+- 管理台去掉「显示名称」和「改名」；`/v1/models` 的 `name` 直接用 modelId
+
+**验证**：
+- `npm test` 43/43 通过（含 profile 命令行匹配、TCP 端口检查、串行锁、scope 回收）
+- HTTP 冒烟：`/v1/models`、`/api/accounts`、`/api/info`、`/` 均正常；并发建/删方案不丢写
+- 真机 closeChrome：headless Chrome → `taskkill` 成功、端口 9399 释放、
+  profile 目录删除；DELETE 路由 e2e：账号记录清空、health 清空、目录消失
+- 启动中删除：刚 launch 就 close，`kill-starting` 成功，端口未起、目录删除
+
 ## 遗留
 
-- **文件/图片输入**：Quick 的附件走独立的 `upload-attachment` → DLP 扫描 → `files/upload` 流程，
-  需要额外的 REST 调用，当前版本只做文本。
+- **图片输入**：文本/PDF 等文件项已支持（见 `261123-attach`）；图片只做了链路验证，
+  尚未保证所有格式可用。
 - **账号组转移对话**：可从 `one-chrome-ex` 移植，但 Quick 的历史在服务端按 thread 存，
   转移语义要重新设计。
 - **打包 exe**：可参考 `one-chrome-ex` 的 Node SEA 方案。
